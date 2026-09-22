@@ -60,7 +60,7 @@ def validate_op(op):
     if not isinstance(op, dict):
         raise StoreError('op 必须是对象')
     kind = op.get('op')
-    if kind not in ALL_OPS:
+    if not isinstance(kind, str) or kind not in ALL_OPS:
         raise StoreError(f'未知操作类型: {kind!r}（允许: {sorted(ALL_OPS)}）')
     name = op.get('name')
     if not isinstance(name, str) or not (1 <= len(name) <= NAME_MAX):

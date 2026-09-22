@@ -118,3 +118,20 @@ PARAPHRASES = [
     ('查一下规则12的内容', query_record('规则12')),
     ('把规则12改成：首位加一，交换前两位', correct_rule('规则12', ['首位加一', '交换前两位'])),
 ]
+
+# 改写基准 v2：保留以上原话与严格期望，显式修正每例的前置状态。
+# 各例相互独立；教学例名称尚不存在，纠错/查询/执行例已有同种类记录。
+# 不再把六个名称同时塞给所有用例，否则首例 teach 与存在性规则冲突。
+PARAPHRASE_PROTOCOL = 'verifiable_memory/paraphrases@v2'
+PARAPHRASE_KNOWN_SLOTS = [
+    [],
+    [{'name': '实体11', 'kind': 'fact'}],
+    [],
+    [{'name': '规则07', 'kind': 'rule'}],
+    [{'name': '规则07', 'kind': 'rule'}],
+    [{'name': '规则07', 'kind': 'rule'}],
+    [{'name': '实体03', 'kind': 'fact'}],
+    [],
+    [{'name': '规则12', 'kind': 'rule'}],
+    [{'name': '规则12', 'kind': 'rule'}],
+]

@@ -24,6 +24,8 @@ jobs:
         run: python tests/checks.py
       - name: Checkpoint and audit regressions
         run: python tests/regressions.py
+      - name: LLM protocols and CLI regressions (local HTTP fixtures)
+        run: python tests/llm_checks.py
       - name: Frozen demo
         run: python cli.py script
       - name: Replay demo

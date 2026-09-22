@@ -12,10 +12,10 @@
   python3 cli.py paraphrases --llm
   python3 cli.py reset
 
-解析器：默认结构化命令后备（无 API key 可跑通全部固定场景）；
---llm 时用 OpenAI 兼容接口（VM_BASE_URL / VM_API_KEY / VM_MODEL）。
+解析器：结构化命令本地执行；有本地配置时口语自动调用模型。
+--llm 强制模型解析，--no-llm 禁用模型，--config 可指定配置文件。
 
-所有会话写入 demo/session.json（默认）或 --session 指定路径；任何
+日常会话写入 memory.db（默认）或 --session 指定路径；任何
 失败都如实退出码 1，不静默兜底。
 """
 
@@ -42,17 +42,34 @@ FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 've
                   'verifiable_memory/llm.py', 'verifiable_memory/parser.py',
                   'verifiable_memory/session.py', 'verifiable_memory/storage.py',
                   'verifiable_memory/__init__.py', 'cli.py',
-                  'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py']
+                  'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py',
+                  'tests/llm_checks.py']
 
 
-def _make_llm(args):
-    if not args.llm:
+def _make_llm(args, allow_local=False):
+    if getattr(args, 'no_llm', False):
+        return None
+    config_path = getattr(args, 'config', None)
+    if not args.llm and not (allow_local and LLM.has_local_config(config_path)):
         return None
     try:
-        return LLM()
+        return LLM(config_path=config_path)
     except LLMError as exc:
         print(f'错误：{exc}', file=sys.stderr)
         sys.exit(1)
+
+
+def _parse_utterance(args, utterance, known_slots, llm):
+    """结构化命令留在本地；有本地配置时，口语才自动调用模型。"""
+    try:
+        return parser_module.parse(utterance, known_slots, llm)
+    except parser_module.ParserError:
+        if llm is not None:
+            raise  # 模型失败不再换后备路径，保留原始错误
+        configured = _make_llm(args, allow_local=True)
+        if configured is None:
+            raise
+        return parser_module.parse(utterance, known_slots, configured)
 
 
 def _load_or_create(path, capacity=None):
@@ -110,8 +127,8 @@ def _run_single(args, category):
     session = _load_or_create(args.session)
     try:
         try:
-            op, source = parser_module.parse(args.utterance, session.store.known_slots(), llm)
-        except (parser_module.ParserError, ValueError) as exc:
+            op, source = _parse_utterance(args, args.utterance, session.store.known_slots(), llm)
+        except (parser_module.ParserError, store.StoreError, LLMError, ValueError) as exc:
             print(f'解析失败：{exc}', file=sys.stderr)
             sys.exit(1)
         try:
@@ -330,8 +347,8 @@ def _repl_loop(args, llm, session):
         if line in ('exit', 'quit', '退出'):
             break
         try:
-            op, source = parser_module.parse(line, session.store.known_slots(), llm)
-        except (parser_module.ParserError, ValueError) as exc:
+            op, source = _parse_utterance(args, line, session.store.known_slots(), llm)
+        except (parser_module.ParserError, store.StoreError, LLMError, ValueError) as exc:
             print(f'解析失败：{exc}')
             continue
         category = {'teach_fact': 'teach', 'teach_rule': 'teach',
@@ -426,32 +443,43 @@ def _write_transcript(rows, result):
 
 
 def cmd_paraphrases(args):
-    """PROTOCOL 场景7：预声明改写 → 期望 op，逐条比较，如实报告。"""
-    llm = _make_llm(args)
+    """改写基准 v2：显式前置状态，严格比较原始期望，不做语义放宽。"""
+    out_arg = getattr(args, 'out', None)
+    out = Path(out_arg) if out_arg else HERE / 'demo' / 'paraphrase_result.json'
+    if out.exists():
+        raise SystemExit(f'拒绝覆盖：{out}')
+    if len(data.PARAPHRASES) != len(data.PARAPHRASE_KNOWN_SLOTS):
+        raise SystemExit('改写用例与前置状态数量不一致')
+    llm = _make_llm(args, allow_local=True)
     if llm is None:
         raise SystemExit('改写鲁棒性测试需要 --llm（无 key 时本测试不适用，'
                          '固定场景用后备文法已覆盖）')
+    # 在调用前冻结本次输入、期望、提示词摘要；结果文件保留原始配置。
+    cases = [{'utterance': utterance, 'expected': expected, 'known_slots': known}
+             for (utterance, expected), known in
+             zip(data.PARAPHRASES, data.PARAPHRASE_KNOWN_SLOTS)]
+    prompt_hash = hashlib.sha256(parser_module.SYSTEM_PROMPT.encode('utf-8')).hexdigest()
     rows = []
-    for utterance, expected_op in data.PARAPHRASES:
+    for case in cases:
+        utterance, expected_op = case['utterance'], case['expected']
         try:
-            op, source = parser_module.parse_with_llm(
-                utterance, parser_module.SCENARIO_KNOWN_SLOTS, llm)
-            rows.append({'utterance': utterance, 'expected': expected_op,
-                         'got': op, 'match': op == expected_op, 'error': None})
+            op = parser_module.parse_with_llm(utterance, case['known_slots'], llm)
+            rows.append({**case, 'got': op, 'match': op == expected_op, 'error': None})
         except (parser_module.ParserError, ValueError, LLMError) as exc:
-            rows.append({'utterance': utterance, 'expected': expected_op,
-                         'got': None, 'match': False, 'error': str(exc)})
+            rows.append({**case, 'got': None, 'match': False, 'error': str(exc)})
     matches = sum(1 for r in rows if r['match'])
     print(f'改写解析：{matches}/{len(rows)} 与预声明 op 一致')
     for r in rows:
         mark = '✓' if r['match'] else '✗'
         got = json.dumps(r['got'], ensure_ascii=False) if r['got'] is not None else f"失败: {r['error']}"
         print(f"  {mark} {r['utterance']} → {got}")
-    out = HERE / 'demo' / 'paraphrase_result.json'
-    if out.parent.exists():
-        if out.exists():
-            raise SystemExit(f'拒绝覆盖：{out}')
-        out.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding='utf-8')
+    if out_arg or out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        report = {'protocol': data.PARAPHRASE_PROTOCOL,
+                  'parser_prompt_sha256': prompt_hash,
+                  'model': llm.model, 'api_style': llm.api_style,
+                  'matches': matches, 'n_cases': len(rows), 'rows': rows}
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
         print(f'结果已写入 {out}')
     sys.exit(0 if matches == len(rows) else 1)
 
@@ -461,7 +489,10 @@ def main():
     ap.add_argument('--session', default=str(DEFAULT_SESSION), help='会话文件路径')
     ap.add_argument('--capacity', type=int, default=None,
                     help='新建会话时的槽位容量（默认 256；已存在的会话沿用其容量）')
-    ap.add_argument('--llm', action='store_true', help='用 OpenAI 兼容 LLM 解析')
+    ap.add_argument('--config', help='模型配置文件（默认 ~/.config/verifiable-memory/config.json）')
+    llm_options = ap.add_mutually_exclusive_group()
+    llm_options.add_argument('--llm', action='store_true', help='强制使用已配置模型解析')
+    llm_options.add_argument('--no-llm', action='store_true', help='仅使用本地结构化文法，不调用模型')
     ap.add_argument('--json', action='store_true', help='输出原始条目 JSON')
     sub = ap.add_subparsers(dest='command', required=True)
     for name, fn, help_text in (
@@ -486,6 +517,8 @@ def main():
             p.add_argument('--dry-run', action='store_true', help='只预检不写入')
         if name == 'export':
             p.add_argument('--out', default=None, help='证据输出路径（默认 <会话名>.session.json）')
+        if name == 'paraphrases':
+            p.add_argument('--out', default=None, help='保存带协议版本与逐例上下文的测试结果（拒绝覆盖）')
         if name == 'search':
             p.add_argument('query', help='关键词（名称与内容的子串匹配）')
         p.set_defaults(func=fn)

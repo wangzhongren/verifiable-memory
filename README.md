@@ -56,6 +56,7 @@ python3 verify.py
 # 基础自检 + 检查点/审计回归测试（无需 API key）
 python3 tests/checks.py
 python3 tests/regressions.py
+python3 tests/llm_checks.py
 ```
 
 日常使用（一命令一进程，跨进程持久；默认记忆库 `memory.db`，SQLite）：
@@ -81,14 +82,30 @@ python3 cli.py import knowledge.jsonl --on-conflict correct       # 已存在则
 
 JSONL 格式，每行一条：`{"kind":"fact","name":"...","content":"..."}` 或 `{"kind":"rule","name":"...","program":["反转",...]}`。坏行按行报告、不拖垮整批、不落日志。**导入必须过验证边界**：每条都是真实留痕的操作，没有任何绕过日志的直插。
 
-LLM 解析模式（可选；无 key 时上述结构化文法即后备，功能完整）：
+本地模型配置（可选）：把配置保存到 `~/.config/verifiable-memory/config.json`，此文件不在仓库里。例如 Anthropic 兼容服务：
+
+```json
+{
+  "api_style": "anthropic",
+  "base_url": "https://your-provider.example",
+  "model": "your-model",
+  "auth_token": "replace-with-your-token"
+}
+```
+
+`auth_token` 使用 Bearer 认证；使用 API key 的服务改填 `api_key`，两者选一个。OpenAI 兼容服务使用 `api_style: "openai"`、`base_url: "https://your-provider.example/v1"` 和 `api_key`。文件权限建议设为 `600`。
+
+配置一次后即可直接使用口语：
 
 ```bash
-export VM_BASE_URL=https://api.deepseek.com/v1   # 任何 OpenAI 兼容接口
-export VM_API_KEY=sk-...
-export VM_MODEL=deepseek-chat
-python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测试
+python3 cli.py teach "请帮我记一条事实，名称是项目主干，内容是main。"
+python3 cli.py ask "项目主干是什么？"             # → main
+python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝覆盖
 ```
+
+结构化文法能识别的命令仍在本地执行；口语在找到本地模型配置后自动调用服务。`--llm` 强制走模型，`--no-llm` 禁用模型，`--config <路径>` 指定另一份本地配置；这些全局选项放在子命令之前。模型返回错误不会静默改用后备解析。
+
+本地配置优先于环境配置，不跨来源借用认证信息。没有本地配置时仍兼容原有 `VM_*` / `OPENAI_*` / `ANTHROPIC_*` 环境配置，需显式 `--llm`；`VM_API_STYLE` 可选择协议。Anthropic 的环境配置读取 `ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL`、`ANTHROPIC_AUTH_TOKEN`（或 `ANTHROPIC_API_KEY`）。
 
 ## 命令一览
 
@@ -145,11 +162,12 @@ python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测�
 │   ├── executor.py   # 执行器接口 + 符号后端（逐步 trace，失败即抛错）
 │   ├── proof.py      # 零附带损害证书（v2 O(1)；v1 全表格式兼容读取）
 │   ├── parser.py     # NL→op：LLM 结构化输出（白名单）+ 无 key 后备文法
-│   ├── llm.py        # OpenAI 兼容适配器（urllib；温度 0；密钥只从环境读）
+│   ├── llm.py        # 本地配置 + OpenAI/Anthropic 调用（urllib；温度 0）
 │   ├── session.py    # op 日志 + 哈希链 + 乐观并发 + 快照/尾部加载
 │   └── storage.py    # SQLite 工作存储（ops 只追加 + state 缓存 + 检查点）；JSON 证据格式
 ├── tests/checks.py                   # 基础自检（含真子进程并发压力与篡改测试）
 ├── tests/regressions.py              # 检查点边界、完整事件链和事务回滚回归测试
+├── tests/llm_checks.py               # 本地 HTTP 服务验证协议、配置和 CLI；无需真实密钥
 ├── docs/PROTOCOL.md                  # 预声明的验收标准与期望值（先冻结后执行）
 ├── docs/REPORT.md                    # 研发记录：验收结果、机制事实、抓到的 bug
 └── examples/import_knowledge.jsonl   # 示例知识文件（可直接导入试用）
@@ -162,6 +180,7 @@ python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测�
 ```bash
 python3 tests/checks.py
 python3 tests/regressions.py
+python3 tests/llm_checks.py
 ```
 
 覆盖：两套原语实现全原语一致、store 全部错误路径、证书 O(1) 与断言、后备文法解析全场景、哈希链与重载、SQLite 双向篡改检测、证据逐字节等价（JSON 后端 == SQLite 导出）、快照分工、检索、批量导入幂等、5 进程并发压力、跨进程四步管线 + 灵魂样例独立断言。
@@ -172,7 +191,7 @@ python3 tests/regressions.py
 
 **旧 v1 数据不会自动迁移或覆盖。** 当前版本拒绝把缺少完整事件链的 v1 文件当作 v2 核验。请保留原库和原证据，用对应旧版本读取/核验；需要继续使用其内容时，先导出为知识 JSONL，再用 `--session <新文件.db> import <文件.jsonl>` 建立新库。重新导入只保留知识内容，不延续旧历史的证明，不能追溯证明旧来源字段未被修改。不要直接修改格式标记，也不必 reset 旧库。
 
-修复细节与验证范围见 [docs/FIXES.md](docs/FIXES.md)。GitHub Actions 配置在 Python 3.10 / 3.14 上执行基础自检、回归测试和完整演示链。
+存储修复见 [docs/FIXES.md](docs/FIXES.md)；本地配置、解析与真实模型复测见 [docs/LLM_FIXES.md](docs/LLM_FIXES.md)。GitHub Actions 配置在 Python 3.10 / 3.14 上执行基础自检、回归测试和完整演示链。
 
 ## 限制（如实）
 
