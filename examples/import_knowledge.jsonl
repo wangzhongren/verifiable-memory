@@ -1,0 +1,8 @@
+{"kind": "fact", "name": "轮次01结论", "content": "RDSD 结构当 LM 骨干输给 GRU，不放大——纯神经路线在通用语言任务上无优势"}
+{"kind": "fact", "name": "轮次07结论", "content": "自主读取控制器训练1-3步规则、测试6/8步无oracle，KV/FSD正交绑定/softmax记忆三后端均约100%"}
+{"kind": "fact", "name": "轮次07对照", "content": "旧软注意力解析器仅2.83%/0.39%——学习型软寻址输给显式寻址的直接证据"}
+{"kind": "fact", "name": "轮次07FSD", "content": "FSD无独有读出优势（B矩阵与线性注意力代数等价）；键相关时delta矩阵8步降至25.34%，softmax KV仍99.97%"}
+{"kind": "fact", "name": "轮次08定案", "content": "串扰由H=DᵀA决定（修正了干扰只看键Gram的旧表述）；欧氏正交充分不必要；必要充分=A列满秩且DᵀA=I"}
+{"kind": "fact", "name": "轮次08边界", "content": "对偶读是离线oracle，在线维护成本未测；‖A⁻ᵀ‖随ρ发散（4.47@ρ=.95）；容量N≤m未测"}
+{"kind": "fact", "name": "战略路线", "content": "混合式：显式层（存储、指针、程序）+神经层（理解、执行）；五级梯子：自主指针→解析层→事实扩容100+→条件循环→真实LLM agent"}
+{"kind": "fact", "name": "措辞纪律", "content": "单调扫描+终止线索属于结构提供顺序，不得写成模型学会推进；机制结果不得写成自然Transformer内存在FSD的坐标"}

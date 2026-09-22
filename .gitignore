@@ -1,0 +1,29 @@
+# 私有记忆库与现场测试库（含个人数据，勿提交）
+memory.db
+memory.db-wal
+memory.db-shm
+field_test.db
+field_test.db-wal
+field_test.db-shm
+import_demo.db
+import_demo.db-wal
+import_demo.db-shm
+*.db-journal
+
+# 会话/证据导出（可再生：cli.py export）
+*.session.json
+memory.session*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时生成的演示证据（cli.py script 可再生）
+demo/
+
+# macOS
+.DS_Store
+
+# 临时产物
+*.tmp
