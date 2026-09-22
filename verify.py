@@ -26,7 +26,6 @@ import sys
 from pathlib import Path
 
 # 哈希公共面：与 store.py 刻意共享的唯一函数。
-from verifiable_memory import store
 from verifiable_memory.store import canonical_json, sha256_string
 
 HERE = Path(__file__).resolve().parent
@@ -132,6 +131,31 @@ def verify(session_path, replayed_path):
     replayed = json.loads(replayed_path.read_text(encoding='utf-8'))
     entries, capacity = session_raw['entries'], session_raw['capacity']
 
+    # 独立实现完整事件链；不调用 audit.py 或存储/会话层。
+    if session_raw.get('format') != 'verifiable_memory_01/session@v2':
+        failures.append('需要 session@v2 证据；旧 v1 请用旧版本核验')
+    if type(session_raw.get('n_ops')) is not int or session_raw['n_ops'] != len(entries):
+        failures.append('证据 n_ops 与日志条数不符')
+    previous = sha256_string(canonical_json(
+        {'format': 'verifiable_memory_01/log@v2', 'capacity': capacity}))
+    for seq, entry in enumerate(entries, 1):
+        if entry.get('op_id') != f'op-{seq:03d}':
+            failures.append(f'日志序号不连续：期望 op-{seq:03d}')
+        if entry.get('prev_entry_hash') != previous:
+            failures.append(f'op-{seq:03d}: 日志前驱哈希不符')
+        digest = sha256_string(canonical_json(
+            {k: v for k, v in entry.items() if k != 'entry_hash'}))
+        if entry.get('entry_hash') != digest:
+            failures.append(f'op-{seq:03d}: 完整日志条目哈希不符')
+        previous = entry.get('entry_hash')
+    if session_raw.get('log_head') != previous:
+        failures.append('证据 log_head 与日志终态不符')
+    source_hash = hashlib.sha256(session_path.read_bytes()).hexdigest()
+    if replayed.get('source_session_sha256') != source_hash:
+        failures.append('replayed.json 不属于当前证据文件')
+    if replayed.get('n_failures') != 0 or replayed.get('n_entries') != len(entries):
+        failures.append('replayed.json 未成功重放当前完整日志')
+
     # 1. 哈希链 + 错误条目无副作用
     empty_hash = sha256_string(canonical_json(
         {'format': 'verifiable_memory_01/state@v1', 'capacity': capacity, 'slots': {}}))
@@ -155,7 +179,11 @@ def verify(session_path, replayed_path):
     states, problems, _, final_hashes = independent_replay(entries, capacity)
     failures += problems
     for entry in entries:
-        if entry['status'] != 'ok' or 'proof' not in entry:
+        if entry['status'] != 'ok':
+            continue
+        if entry['op']['op'] in ('teach_fact', 'teach_rule', 'correct_fact', 'correct_rule') and 'proof' not in entry:
+            failures.append(f"{entry['op_id']}: 成功写操作缺少证书")
+        if 'proof' not in entry:
             continue
         cert = entry['proof']
         target = cert.get('target')

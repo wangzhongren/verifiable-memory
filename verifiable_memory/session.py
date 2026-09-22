@@ -1,7 +1,7 @@
 """会话编排：op 日志 + 哈希链 + 持久化（后端可插拔）。
 
 日志是唯一事实来源；state 表/文件快照皆为派生缓存，load 时必须
-通过"重放 vs 缓存"核对——对缓存或日志的任何一手改动在这里暴露。
+核对检查点、尾部日志与当前缓存；历史段的全量审计由离线核验负责。
 
 两个后端（storage.py）：
 - JSON 文件（demo 冻结证据、小会话）：整文件原子重写；
@@ -21,7 +21,8 @@ from pathlib import Path
 
 from . import executor
 from . import store
-from .storage import (JsonStorage, SQLITE_SUFFIXES, SESSION_FORMAT,
+from .audit import AuditError, check_log, entry_digest, log_genesis
+from .storage import (JsonStorage, SQLITE_SUFFIXES,
                      SqliteStorage, StaleStateError, StorageError)
 from .store import CAPACITY_DEFAULT, state_digest
 
@@ -59,32 +60,24 @@ def _structural_check(entries, capacity, anchor=None):
         expected_before = entry['state_hash_after']
 
 
-def _rebuild(entries, capacity):
-    """从日志重放所有成功的写操作，重建 Store（日志是唯一事实来源）。"""
-    rebuilt = store.Store(capacity)
-    for entry in entries:
-        if entry.get('status') == 'ok' and entry['op']['op'] in store.WRITE_OPS:
-            rebuilt.apply_write(entry['op'], op_id=entry['op_id'],
-                                utterance=entry.get('utterance', ''))
-    return rebuilt
-
-
 class Session:
     """一次连续教学/问答会话。所有状态变化都留下日志与哈希链。
 
     SQLite 后端下 self.entries 只持有**尾部**（最近检查点之后的条
-    目）——快照部分由 state 表 O(N) 重建、用 snapshot_hash 锚定；
+    目）——快照部分由 checkpoint_state 表 O(N) 重建、用哈希锚定；
     全量重放核验是 replay.py/verify.py 的离线职责，不在每条命令的
     热路径上。self.n_ops 为日志总条数（无检查点概念的后端 = 尾部长
     度）。"""
 
-    def __init__(self, path, capacity, entries, store_obj, storage, n_ops=None):
+    def __init__(self, path, capacity, entries, store_obj, storage, n_ops=None,
+                 log_head=None):
         self.path = Path(path)
         self.capacity = capacity
         self.entries = entries
         self.store = store_obj
         self.storage = storage
         self.n_ops = n_ops if n_ops is not None else len(entries)
+        self.log_head = log_head if log_head is not None else log_genesis(capacity)
 
     # ---- 生命周期 ----
 
@@ -93,11 +86,12 @@ class Session:
         path = Path(path)
         if path.exists():
             raise SessionError(f'会话已存在，拒绝覆盖：{path}（如需重开请先 reset）')
+        store_obj = store.Store(capacity)
         if path.suffix in SQLITE_SUFFIXES:
             storage = SqliteStorage.create(path, capacity)
         else:
             storage = JsonStorage.create(path, capacity)
-        return cls(path, capacity, [], store.Store(capacity), storage)
+        return cls(path, capacity, [], store_obj, storage)
 
     @classmethod
     def load(cls, path):
@@ -109,52 +103,58 @@ class Session:
         else:
             storage = JsonStorage(path, capacity=None)
         try:
-            snap = storage.snapshot()
-        except StorageError as exc:
+            return cls._from_snapshot(path, storage, storage.snapshot())
+        except (StorageError, AuditError, store.StoreError) as exc:
+            if isinstance(storage, SqliteStorage):
+                storage.close()
             raise SessionError(str(exc)) from exc
-        capacity = snap['capacity']
-        entries = snap['entries']
-        if not isinstance(capacity, int) or not isinstance(entries, list):
-            raise SessionError('会话缺少 capacity 或 entries')
+        except Exception:
+            if isinstance(storage, SqliteStorage):
+                storage.close()
+            raise
 
-        if snap.get('state_records') is not None and snap.get('snapshot_seq'):
-            # 快照路径（SQLite，已到过检查点）：state 表 O(N) 重建 +
-            # snapshot_hash 锚定 + 尾部重放。快照段内的日志篡改由此处
-            # **有意放行**——它由离线的 replay/verify 全量重放负责（数
-            # 据库工程的 WAL/checkpoint 分工）；快照缓存本身的篡改被
-            # snapshot_hash 锚抓住。snapshot_seq=0（首个检查点前）时
-            # state 缓存领先于快照锚，必须走全量重放。
-            rebuilt = store.Store(capacity)
-            rebuilt.slots.update(snap['state_records'])
-            snapshot_hash = snap.get('snapshot_hash')
-            if rebuilt.state_hash() != snapshot_hash:
-                raise SessionError('state 快照与 snapshot_hash 不符——缓存被篡改或损坏')
-            _structural_check(entries, capacity, anchor=snapshot_hash)
-            for entry in entries:
-                if entry.get('status') == 'ok' and entry['op']['op'] in store.WRITE_OPS:
-                    try:
-                        rebuilt.apply_write(entry['op'], op_id=entry['op_id'],
-                                            utterance=entry.get('utterance', ''))
-                    except store.StoreError as exc:
-                        raise SessionError(f"{entry.get('op_id')} 尾部重放失败：{exc}") from exc
-            last_after = entries[-1]['state_hash_after'] if entries else snapshot_hash
-            if rebuilt.state_hash() != last_after:
-                raise SessionError('尾部重放后的状态哈希与会话终态不符——日志可能被篡改')
-            if snap.get('chain_head') != last_after:
-                raise SessionError('meta.chain_head 与日志终态不符——元数据被篡改')
-        else:
-            # 全量重放路径（JSON 小会话；或 SQLite 首个检查点之前）
-            _structural_check(entries, capacity)
-            rebuilt = _rebuild(entries, capacity)
-            last_after = entries[-1]['state_hash_after'] if entries else _empty_state_hash(capacity)
-            if rebuilt.state_hash() != last_after:
-                raise SessionError('重放后的状态哈希与会话终态不符——日志可能被篡改')
-            # state 缓存仍是派生态：与重放结果比对（O(N) 字典比对，无哈希）
-            if snap.get('state_records') is not None and snap['state_records'] != rebuilt.slots:
-                raise SessionError('state 缓存与日志重放不符——缓存被篡改')
+    @classmethod
+    def _from_snapshot(cls, path, storage, snap):
+        capacity, entries = snap['capacity'], snap['entries']
+        if type(capacity) is not int or capacity < 1 or not isinstance(entries, list):
+            raise SessionError('会话 capacity / entries 非法')
+        n_ops, snapshot_seq = snap['n_ops'], snap.get('snapshot_seq', 0)
+        if (type(n_ops) is not int or type(snapshot_seq) is not int
+                or not 0 <= snapshot_seq <= n_ops
+                or snapshot_seq + len(entries) != n_ops):
+            raise SessionError('日志条数或检查点序号不符')
 
+        rebuilt = store.Store(capacity)
+        anchor = _empty_state_hash(capacity)
+        log_anchor = log_genesis(capacity)
+        if snapshot_seq:
+            # 检查点实体独立于最新 state 缓存，只在检查点事务中更新。
+            rebuilt.slots.update(snap['checkpoint_records'])
+            anchor = snap['snapshot_hash']
+            log_anchor = snap['snapshot_log_hash']
+            if rebuilt.state_hash() != anchor:
+                raise SessionError('checkpoint_state 与 snapshot_hash 不符')
+        elif snap.get('checkpoint_records'):
+            raise SessionError('零序号检查点应为空')
+
+        log_head = check_log(entries, capacity, anchor=log_anchor,
+                             start_seq=snapshot_seq)
+        if log_head != snap['log_head']:
+            raise SessionError('log_head 与日志终态不符')
+        _structural_check(entries, capacity, anchor=anchor)
+        for entry in entries:
+            if entry['status'] == 'ok' and entry['op']['op'] in store.WRITE_OPS:
+                store.validate_op(entry['op'])
+                rebuilt.apply_write(entry['op'], op_id=entry['op_id'],
+                                    utterance=entry['utterance'])
+            if rebuilt.state_hash() != entry['state_hash_after']:
+                raise SessionError(f"{entry['op_id']}: 重放后的状态哈希不符")
+        if snap.get('chain_head') is not None and snap['chain_head'] != rebuilt.state_hash():
+            raise SessionError('meta.chain_head 与日志终态不符')
+        if snap.get('state_records') is not None and snap['state_records'] != rebuilt.slots:
+            raise SessionError('state 缓存与日志重放不符——缓存被篡改')
         return cls(path, capacity, entries, rebuilt, storage,
-                   n_ops=snap.get('n_ops'))
+                   n_ops=n_ops, log_head=log_head)
 
     def close(self):
         if isinstance(self.storage, SqliteStorage):
@@ -170,16 +170,24 @@ class Session:
         并发（SQLite 后端）：被抢先则重载重试，重试耗尽抛 SessionError。
         """
         for attempt in range(1, max_attempts + 1):
-            entry, mutated = self._apply_once(op, category, source, utterance)
+            before_slots = self.store.slots.copy()
             try:
-                self.storage.append_entry(entry, mutated, seq=len(self.entries) + 1)
+                entry, mutated = self._apply_once(op, category, source, utterance)
+                self.storage.append_entry(entry, mutated, seq=self.n_ops + 1)
             except StaleStateError:
+                self.store.slots = before_slots
+                self._reload()
                 if attempt == max_attempts:
                     raise SessionError(f'并发冲突：重试 {max_attempts} 次未成功，请稍后重试')
-                self._reload()
                 continue
             except StorageError as exc:
+                self.store.slots = before_slots
                 raise SessionError(f'持久化失败：{exc}') from exc
+            except Exception:
+                self.store.slots = before_slots
+                raise
+            self.n_ops += 1
+            self.log_head = entry['entry_hash']
             self.entries.append(entry)
             return entry
         raise SessionError('apply：不可达状态')
@@ -188,7 +196,7 @@ class Session:
         """执行一次（可能被并发作废）：产出条目；写操作同时返回
         (name, record) 供缓存更新。"""
         allowed = CATEGORIES[category]
-        op_id = f'op-{len(self.entries) + 1:03d}'
+        op_id = f'op-{self.n_ops + 1:03d}'
         entry = {'op_id': op_id, 'category': category, 'source': source,
                  'utterance': utterance, 'op': op, 'status': None,
                  'state_hash_before': self.store.state_hash()}
@@ -212,6 +220,8 @@ class Session:
             entry['status'] = 'error'
             entry['error'] = str(exc)
         entry['state_hash_after'] = self.store.state_hash()
+        entry['prev_entry_hash'] = self.log_head
+        entry['entry_hash'] = entry_digest(entry)
         return entry, mutated
 
     def _reload(self):
@@ -222,6 +232,7 @@ class Session:
         self.entries = fresh.entries
         self.store = fresh.store
         self.n_ops = fresh.n_ops
+        self.log_head = fresh.log_head
         fresh.close()
 
     # ---- 报告 ----

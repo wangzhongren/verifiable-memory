@@ -12,8 +12,8 @@
   文件逐字节一致（checks.py 有断言）。op/result/proof 以保序 JSON
   存储（不排序键），往返后与旧 JSON 后端逐字节一致。
 
-不变量：日志是唯一事实来源，state/meta 皆为派生缓存；对缓存或
-ops 行的任何一手改动都会被 load 时的"重放 vs 缓存"核对当场抓住。
+不变量：日志是唯一事实来源，state/meta 皆为派生缓存；工作路径核对
+当前缓存、独立检查点与尾部日志；历史段的完整审计由 replay/verify 负责。
 """
 
 import json
@@ -21,15 +21,14 @@ import os
 import sqlite3
 from pathlib import Path
 
-from .store import canonical_json, STATE_FORMAT, state_digest
+from .store import STATE_FORMAT, state_digest
+from .audit import (AuditError, DB_FORMAT, SESSION_FORMAT, check_evidence,
+                    log_genesis)
 
-SESSION_FORMAT = 'verifiable_memory_01/session@v1'
-DB_FORMAT = 'verifiable_memory_01/sqlite@v1'
 SQLITE_SUFFIXES = {'.db', '.sqlite', '.sqlite3'}
 
-# 每 interval 条 op 触发一次检查点（把 meta 的 snapshot_seq/snapshot_hash
-# 推进到当前位）。state 表本身与每个写事务同步更新，因此它就是快照
-# 的实体——检查点只是给"快照到哪了"盖时间戳，O(1)。
+# 每 interval 条操作在同一事务中复制 state 到 checkpoint_state，
+# 并记录状态哈希、日志哈希与全局序号。复制成本 O(N)，之后快照保持不变。
 CHECKPOINT_INTERVAL = 512
 
 _SCHEMA = """
@@ -49,17 +48,24 @@ CREATE TABLE IF NOT EXISTS ops (
   result TEXT,
   proof TEXT,
   hash_before TEXT NOT NULL,
-  hash_after TEXT NOT NULL
+  hash_after TEXT NOT NULL,
+  prev_entry_hash TEXT NOT NULL,
+  entry_hash TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS state (
   name TEXT PRIMARY KEY,
   record TEXT NOT NULL,
   seq_written INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS checkpoint_state (
+  name TEXT PRIMARY KEY,
+  record TEXT NOT NULL
+);
 """
 
 _SQLITE_COLS = ('seq', 'op_id', 'category', 'source', 'utterance', 'op', 'status',
-                'error', 'result', 'proof', 'hash_before', 'hash_after')
+                'error', 'result', 'proof', 'hash_before', 'hash_after',
+                'prev_entry_hash', 'entry_hash')
 
 
 class StorageError(Exception):
@@ -99,6 +105,8 @@ def _entry_from_row(row):
     if row['proof'] is not None:
         entry['proof'] = json.loads(row['proof'])
     entry['state_hash_after'] = row['hash_after']
+    entry['prev_entry_hash'] = row['prev_entry_hash']
+    entry['entry_hash'] = row['entry_hash']
     return entry
 
 
@@ -138,14 +146,20 @@ class JsonStorage:
         raw = self._read()
         if raw.get('format') != SESSION_FORMAT:
             raise StorageError(f"会话格式不符: {raw.get('format')!r}（期望 {SESSION_FORMAT}）")
-        return {'capacity': raw.get('capacity'), 'entries': raw.get('entries', []),
-                'state_records': None, 'snapshot_seq': None,
-                'snapshot_hash': None, 'chain_head': None, 'n_ops': None}
+        try:
+            check_evidence(raw)
+        except AuditError as exc:
+            raise StorageError(str(exc)) from exc
+        return {'capacity': raw['capacity'], 'entries': raw['entries'],
+                'state_records': None, 'snapshot_seq': 0,
+                'snapshot_hash': None, 'chain_head': None,
+                'n_ops': raw['n_ops'], 'log_head': raw['log_head']}
 
     @classmethod
     def create(cls, path, capacity):
         path = Path(path)
-        payload = {'format': SESSION_FORMAT, 'capacity': capacity, 'entries': []}
+        payload = {'format': SESSION_FORMAT, 'capacity': capacity, 'entries': [],
+                   'n_ops': 0, 'log_head': log_genesis(capacity)}
         tmp = path.with_suffix('.tmp')
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
         os.replace(tmp, path)
@@ -155,7 +169,15 @@ class JsonStorage:
         raw = self._read()
         if raw.get('format') != SESSION_FORMAT:
             raise StorageError(f"会话格式不符: {raw.get('format')!r}")
-        raw['entries'] = list(raw.get('entries', [])) + [entry]
+        try:
+            check_evidence(raw)
+        except AuditError as exc:
+            raise StorageError(str(exc)) from exc
+        if raw['n_ops'] != seq - 1 or raw['log_head'] != entry['prev_entry_hash']:
+            raise StaleStateError('JSON 会话已被推进')
+        raw['entries'] = list(raw['entries']) + [entry]
+        raw['n_ops'] = seq
+        raw['log_head'] = entry['entry_hash']
         tmp = self.path.with_suffix('.tmp')
         tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=1), encoding='utf-8')
         os.replace(tmp, self.path)
@@ -186,6 +208,10 @@ class SqliteStorage:
         conn.execute("INSERT INTO meta(key, value) VALUES ('snapshot_seq', ?)", ('0',))
         conn.execute("INSERT INTO meta(key, value) VALUES ('snapshot_hash', ?)", (empty_head,))
         conn.execute("INSERT INTO meta(key, value) VALUES ('n_ops', ?)", ('0',))
+        conn.execute("INSERT INTO meta(key, value) VALUES ('log_head', ?)",
+                     (log_genesis(capacity),))
+        conn.execute("INSERT INTO meta(key, value) VALUES ('snapshot_log_hash', ?)",
+                     (log_genesis(capacity),))
         conn.execute('COMMIT')
         return cls(conn, path)
 
@@ -224,13 +250,13 @@ class SqliteStorage:
                 'chain_head': raw.get('chain_head'),
                 'snapshot_seq': int(raw.get('snapshot_seq', 0)),
                 'snapshot_hash': raw.get('snapshot_hash'),
-                'n_ops': int(raw.get('n_ops', 0))}
+                'n_ops': int(raw['n_ops']), 'log_head': raw['log_head']}
 
     def snapshot(self):
         """一次一致读（WAL 读事务快照）：meta + state 缓存 + 尾部日志。
 
-        只取 seq > snapshot_seq 的尾部条目——state 表即快照实体（与每
-        个写事务同步更新），load 用它 O(N) 重建、重放尾部即可，全量
+        只取 seq > snapshot_seq 的尾部条目——checkpoint_state 是固定
+        快照，state 是最新缓存；load 从快照重放尾部再比对缓存，全量
         重放核验交给离线的 replay/verify。几个读若分开做，并发写者
         可能在两次 SELECT 之间提交，造成假阳性——必须同处一个读事务。
         """
@@ -245,27 +271,44 @@ class SqliteStorage:
                 (snapshot_seq,)).fetchall()
             entries = [_entry_from_row(dict(zip(_SQLITE_COLS, row))) for row in rows]
             cache = self._state_cache()
+            checkpoint = {name: json.loads(record) for name, record in
+                          self.conn.execute('SELECT name, record FROM checkpoint_state')}
+            max_seq = self.conn.execute('SELECT COALESCE(MAX(seq), 0) FROM ops').fetchone()[0]
+            if max_seq != int(raw['n_ops']):
+                raise StorageError('日志最大序号与 n_ops 不符')
+            expected_seqs = list(range(snapshot_seq + 1, int(raw['n_ops']) + 1))
+            if [row[0] for row in rows] != expected_seqs:
+                raise StorageError('尾部日志 seq 不连续')
+            if snapshot_seq:
+                boundary = self.conn.execute(
+                    'SELECT hash_after, entry_hash FROM ops WHERE seq = ?',
+                    (snapshot_seq,)).fetchone()
+                if boundary != (raw['snapshot_hash'], raw['snapshot_log_hash']):
+                    raise StorageError('检查点锚与边界日志不符')
         finally:
             self.conn.execute('COMMIT')
         return {'capacity': int(raw['capacity']), 'entries': entries,
                 'chain_head': raw.get('chain_head'),
                 'snapshot_seq': snapshot_seq,
                 'snapshot_hash': raw.get('snapshot_hash'),
-                'n_ops': int(raw.get('n_ops', 0)),
-                'state_records': cache}
+                'n_ops': int(raw['n_ops']), 'log_head': raw['log_head'],
+                'snapshot_log_hash': raw['snapshot_log_hash'],
+                'checkpoint_records': checkpoint, 'state_records': cache}
 
     # ---- 写 ----
 
     def append_entry(self, entry, mutated, seq):
         """把一条条目落库（单立即事务）：核对链头 → 插 ops → 更新
-        state 缓存与 chain_head；到达检查点间隔时推进 snapshot_seq/
-        snapshot_hash（state 表实体已同步，O(1)）。被并发进程抢先抛
+        state 缓存与两种链头；到达检查点间隔时原子复制快照并推进
+        snapshot_seq / snapshot_hash / snapshot_log_hash。被并发进程抢先抛
         StaleStateError。"""
         try:
             self.conn.execute('BEGIN IMMEDIATE')
-            head = self.conn.execute(
-                "SELECT value FROM meta WHERE key = 'chain_head'").fetchone()[0]
-            if head != entry['state_hash_before']:
+            meta = self._meta()
+            head = meta['chain_head']
+            if (head != entry['state_hash_before']
+                    or meta['log_head'] != entry['prev_entry_hash']
+                    or int(meta['n_ops']) != seq - 1):
                 raise StaleStateError(
                     f'链头被并发进程推进：{str(head)[:12]} ≠ 预期 '
                     f'{entry["state_hash_before"][:12]}')
@@ -276,7 +319,8 @@ class SqliteStorage:
                  entry['utterance'], _order_json(entry['op']), entry['status'],
                  entry.get('error'), _maybe_text(entry.get('result')),
                  _maybe_text(entry.get('proof')),
-                 entry['state_hash_before'], entry['state_hash_after']))
+                 entry['state_hash_before'], entry['state_hash_after'],
+                 entry['prev_entry_hash'], entry['entry_hash']))
             if mutated is not None:
                 name, record = mutated
                 self.conn.execute(
@@ -285,11 +329,19 @@ class SqliteStorage:
             self.conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'chain_head'",
                 (entry['state_hash_after'],))
+            self.conn.execute("UPDATE meta SET value = ? WHERE key = 'log_head'",
+                              (entry['entry_hash'],))
             self.conn.execute("UPDATE meta SET value = ? WHERE key = 'n_ops'",
                               (str(seq),))
             snapshot_seq = int(self.conn.execute(
                 "SELECT value FROM meta WHERE key = 'snapshot_seq'").fetchone()[0])
             if seq - snapshot_seq >= CHECKPOINT_INTERVAL:
+                self.conn.execute('DELETE FROM checkpoint_state')
+                self.conn.execute('INSERT INTO checkpoint_state(name, record) '
+                                  'SELECT name, record FROM state')
+                self.conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'snapshot_log_hash'",
+                    (entry['entry_hash'],))
                 self.conn.execute(
                     "UPDATE meta SET value = ? WHERE key = 'snapshot_seq'", (str(seq),))
                 self.conn.execute(
@@ -301,7 +353,8 @@ class SqliteStorage:
             raise
         except sqlite3.IntegrityError as exc:
             self.conn.execute('ROLLBACK')
-            raise StaleStateError(f'唯一性冲突（并发插入同一序号）：{exc}') from exc
+            # 在立即事务中已用全局序号和事件链头排除了并发推进。
+            raise StorageError(f'数据库约束失败：{exc}') from exc
         except sqlite3.OperationalError as exc:
             self._safe_rollback()
             raise StorageError(f'数据库忙/失败：{exc}') from exc
@@ -335,7 +388,7 @@ def export_evidence(db_path, out_path):
     finally:
         storage.close()
     payload = {'format': SESSION_FORMAT, 'capacity': int(raw['capacity']),
-               'entries': entries}
+               'entries': entries, 'n_ops': int(raw['n_ops']), 'log_head': raw['log_head']}
     out_path = Path(out_path)
     tmp = out_path.with_suffix('.tmp')
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')

@@ -37,12 +37,12 @@ HERE = Path(__file__).resolve().parent
 DEMO = HERE / 'demo'
 DEFAULT_SESSION = HERE / 'memory.db'
 
-FREEZE_SOURCES = ['verifiable_memory/data.py', 'verifiable_memory/store.py',
+FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 'verifiable_memory/store.py',
                   'verifiable_memory/executor.py', 'verifiable_memory/proof.py',
                   'verifiable_memory/llm.py', 'verifiable_memory/parser.py',
                   'verifiable_memory/session.py', 'verifiable_memory/storage.py',
                   'verifiable_memory/__init__.py', 'cli.py',
-                  'replay.py', 'verify.py', 'tests/checks.py']
+                  'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py']
 
 
 def _make_llm(args):

@@ -133,7 +133,7 @@ class Store:
             target_hash_before = None
         else:
             if existing is None:
-                known = '、'.join(self.slots) or '（空）'
+                known = '、'.join(sorted(self.slots)) or '（空）'
                 raise StoreError(f'名称不存在：{name}（已知槽位: {known}）')
             want_kind = 'fact' if kind == 'correct_fact' else 'rule'
             if existing['kind'] != want_kind:
@@ -165,7 +165,7 @@ class Store:
         name = op['name']
         record = self.slots.get(name)
         if record is None:
-            known = '、'.join(self.slots) or '（空）'
+            known = '、'.join(sorted(self.slots)) or '（空）'
             raise StoreError(f'名称不存在：{name}（已知槽位: {known}）')
 
         if kind == 'query_record':
@@ -180,7 +180,7 @@ class Store:
         else:  # apply_rule
             if record['kind'] != 'rule':
                 raise StoreError(f'{name} 是事实记录，不能作为规则执行')
-            import executor
+            from . import executor
             run = executor.execute(record['program'], op['input'])
             result = {'name': name, 'kind': 'rule', 'input': op['input'],
                       'written_by': record['written_by'], 'revision': record['revision'],

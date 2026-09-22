@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from verifiable_memory import store
+from verifiable_memory.audit import AuditError, check_evidence, check_log
 
 HERE = Path(__file__).resolve().parent
 
@@ -37,6 +38,12 @@ def replay(entries, capacity):
     failures = 0
     expected_before = empty_hash
 
+    try:
+        check_log(entries, capacity)
+    except AuditError as exc:
+        return ([{'op_id': 'log', 'kind': 'error', 'ok': False,
+                  'checks': [str(exc)]}], [], empty_hash, 1)
+
     for entry in entries:
         op = entry['op']
         note = {'op_id': entry['op_id'], 'kind': entry['status'], 'checks': []}
@@ -50,6 +57,12 @@ def replay(entries, capacity):
 
         try:
             store.validate_op(op)
+            allowed = {'teach': {'teach_fact', 'teach_rule'},
+                       'correct': {'correct_fact', 'correct_rule'},
+                       'ask': {'query_record', 'apply_rule'}}
+            if op['op'] not in allowed.get(entry['category'], set()):
+                raise store.StoreError(
+                    f"命令类别 {entry['category']} 不允许 op {op['op']}")
             if op['op'] in store.WRITE_OPS:
                 if entry.get('status') == 'error':
                     # 错误写条目：重放必须以同样的消息失败（比对在外壳 except）
@@ -164,8 +177,10 @@ def main():
         raise SystemExit(f'拒绝覆盖：{out_path}')
 
     raw = json.loads(session_path.read_text(encoding='utf-8'))
-    if raw.get('format') != 'verifiable_memory_01/session@v1':
-        raise SystemExit(f"格式不符: {raw.get('format')!r}")
+    try:
+        check_evidence(raw)
+    except AuditError as exc:
+        raise SystemExit(f'证据完整性失败：{exc}') from exc
     entries, capacity = raw['entries'], raw['capacity']
 
     checks, answers, terminal_hash, failures = replay(entries, capacity)

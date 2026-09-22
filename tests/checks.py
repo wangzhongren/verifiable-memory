@@ -217,7 +217,7 @@ def test_evidence_equivalence(tmp):
 
 def test_checkpoint(tmp):
     print('快照+尾部重放（SQLite，间隔压到 3）：')
-    import storage as storage_module
+    from verifiable_memory import storage as storage_module
     db = Path(tmp) / 'cp.db'
     old_interval = storage_module.CHECKPOINT_INTERVAL
     storage_module.CHECKPOINT_INTERVAL = 3

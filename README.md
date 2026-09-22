@@ -9,7 +9,7 @@
 ## English TL;DR
 
 - **What it is**: a small, pure-stdlib Python memory system for LLM agents. Natural language goes in at the edges; inside the verification boundary there are only six deterministic structured operations over named slots (facts + executable rules).
-- **Why it's different**: LLM "memory" is usually a prompt or a vector DB — recall you cannot audit. Here the LLM is kept **upstream of a hard verification boundary**: it may mis-parse, but it can never cross the whitelist, and every error is logged, never silently fixed.
+- **Why it's different**: the LLM stays **upstream of a structured verification boundary**. Accepted operations are deterministic and auditable. Schema checks cannot establish factual truth or correct interpretation; parser failures occur before the operation log.
 - **Guarantees**: SHA-256 hash-chained op log · **zero-collateral-write certificates** (editing slot A provably leaves slots B..N untouched) · **bit-exact replay** from the log alone · a **second independent implementation** of the primitives that must agree · tamper detection · SQLite working store + canonical JSON evidence export.
 - **Requirements**: Python 3.10+ (no third-party packages). One command installs nothing; one file (SQLite) is the whole memory.
 
@@ -25,7 +25,7 @@ LLM agent 的"记忆"通常是一条越来越长的 prompt，或一个向量库�
 2. **纠错可审计**——旧值、新值、第几版，全都在历史里，且改 A 不会弄坏 B；
 3. **状态可重建**——从一份日志出发，任何独立的一方都能逐位重放出同样的记忆。
 
-本项目来自一条神经记忆研究线的工程终点：八轮对照实验（学习型软寻址 vs 显式寻址）一致显示，**显式寻址赢、学习型软寻址输**。于是这个系统把结论推到极致——**把"回忆"这个环节整个删掉**：名称即地址，精确匹配，没有相似度检索。回忆不存在了，所以回忆不会错；模糊性全部推到验证边界上游，由 LLM 消化并由白名单兜底。
+本项目来自一条神经记忆研究线的工程终点：八轮对照实验（学习型软寻址 vs 显式寻址）一致显示，**显式寻址赢、学习型软寻址输**。于是这个系统把结论推到极致——**把"回忆"这个环节整个删掉**：名称即地址，精确匹配，没有相似度检索。按名称取值不再依赖相似度，但名称选择仍可能出错；模糊性移到验证边界上游。白名单约束操作形状，不能保证解析符合用户意图。
 
 ## 架构
 
@@ -53,8 +53,9 @@ python3 cli.py script
 python3 replay.py
 python3 verify.py
 
-# 49 项自检：两套原语实现互查、错误路径、并发压力、篡改检测……
+# 基础自检 + 检查点/审计回归测试（无需 API key）
 python3 tests/checks.py
+python3 tests/regressions.py
 ```
 
 日常使用（一命令一进程，跨进程持久；默认记忆库 `memory.db`，SQLite）：
@@ -117,27 +118,28 @@ python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测�
 
 ## 设计原则
 
-1. **LLM 在验证边界上游**。它负责把人话翻译成六种操作；词表白名单、类别锁、存在性检查三道锁让翻译错误"被拒绝并留痕"，而不是静默通过。
+1. **LLM 在验证边界上游**。它负责把人话翻译成六种操作；词表白名单、类别锁、存在性检查约束结构化操作。合法但选错名称/内容的操作仍可能通过；可审计不等于事实真实或意图正确。
 2. **显式寻址**。名称即地址，纠错 = 同槽覆盖。没有向量、没有相似度——这是有意的设计立场，来自对照实验的结论（学习型软寻址在窄域全面落后）。
-3. **日志是唯一事实来源**。state 表/快照皆是可重建缓存；任何对缓存或日志行的手改都会被"重放 vs 缓存"核对或离线全量重放抓住。
+3. **日志是唯一事实来源**。v2 将完整事件（包括来源、原话、类别、结果、证书、错误）与前驱事件哈希一起散列；状态哈希独立保留。工作路径核对检查点、尾部事件链和当前缓存，历史段由离线全量核验负责。
 4. **独立性是核验的全部价值**。verify.py 只与 store.py 共享两个哈希原语（canonical JSON、sha256），原语执行、槽位应用、证书复核全部独立实现——两套实现不一致即整体失败。开发过程中这套互查真实抓到过 bug。
 5. **失败语义**。执行器对非法输入/未知原语抛错，宿主不得代为修复；错误操作落日志、无副作用、哈希链不断。
 
 ## 信任模型（诚实版）
 
-- **能抓**：手改数据库任意行、手改 state 缓存、手改导出文件——哈希链断裂、终态不符、证书断言复核失败，退出码 1。
-- **不能抓**：能同时重写全部行并重算整条链的攻击者（没有外部锚的哈希链都如此）。工作路径对"检查点之前"的日志段有意只做轻校验（快照锚 + 尾部重放），全量重放核验是 `replay.py`/`verify.py` 的离线职责——数据库工程的 WAL/checkpoint 分工，不是漏洞。
+- **能抓**：不重算链的事件字段修改（包括查询的来源/原话/类别）、缺失哈希、条目乱序、未同步修改计数及链头的日志删减，以及 state/checkpoint_state 内容篡改。工作路径检查尾部，离线重放/核验检查全部事件。SQLite 的物理布局和未参与协议的辅助字段不属于事件证明。
+- **不能抓**：能重写日志并重算链及元数据的攻击者；也无法识别完整旧版本的回滚或同时改写计数和链头的尾部截断（需要外部可信锚）。工作路径对"检查点之前"的日志段有意只做轻校验（快照锚 + 尾部重放），全量重放核验是 `replay.py`/`verify.py` 的离线职责——数据库工程的 WAL/checkpoint 分工，不是漏洞。
 - **并发**：多进程写入走乐观协议（落库前核对链头，被抢先则重载重试）；5 进程真并发压力测试在 `checks.py`。
 
 ## 规模化
 
-默认 256 个命名槽位（`--capacity` 建库时可调，容量烤在哈希链里，改容量 = reset 后重建）。32k 槽规模的改造已就位：证书 v2 O(1)/写、快照+尾部重放（load 不再背全量日志）、确定性检索。再往上的备件（Merkle 增量哈希、FTS5）按需再上。
+默认 256 个命名槽位（`--capacity` 建库时可调，容量烤在哈希链里，改容量 = reset 后重建）。证书 v2 大小为 O(1)，但状态哈希仍为 O(N)；这不意味着写入耗时 O(1)。独立 checkpoint_state 每 512 条操作在事务内复制一次，成本 O(N)，其间从固定快照重放尾部并核对最新缓存。尚未提供 32k 槽性能基准。再往上的备件（Merkle 增量哈希、FTS5）按需再上。
 
 ## 项目结构
 
 ```
 ├── cli.py / replay.py / verify.py    # 三个入口：日常命令 / 独立重放 / 独立核验
 ├── verifiable_memory/                # 核心包
+│   ├── audit.py      # v2 完整事件链、序号和证据封装校验
 │   ├── data.py       # 四原语参考实现 + 预声明场景
 │   ├── store.py      # 命名槽位、精确寻址、op 白名单、canonical JSON + sha256
 │   ├── executor.py   # 执行器接口 + 符号后端（逐步 trace，失败即抛错）
@@ -146,7 +148,8 @@ python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测�
 │   ├── llm.py        # OpenAI 兼容适配器（urllib；温度 0；密钥只从环境读）
 │   ├── session.py    # op 日志 + 哈希链 + 乐观并发 + 快照/尾部加载
 │   └── storage.py    # SQLite 工作存储（ops 只追加 + state 缓存 + 检查点）；JSON 证据格式
-├── tests/checks.py                   # 49 项自检（含真子进程并发压力与篡改测试）
+├── tests/checks.py                   # 基础自检（含真子进程并发压力与篡改测试）
+├── tests/regressions.py              # 检查点边界、完整事件链和事务回滚回归测试
 ├── docs/PROTOCOL.md                  # 预声明的验收标准与期望值（先冻结后执行）
 ├── docs/REPORT.md                    # 研发记录：验收结果、机制事实、抓到的 bug
 └── examples/import_knowledge.jsonl   # 示例知识文件（可直接导入试用）
@@ -157,10 +160,19 @@ python3 cli.py paraphrases --llm                  # 预声明改写鲁棒性测�
 ## 测试
 
 ```bash
-python3 tests/checks.py    # 49 项，全绿为基线
+python3 tests/checks.py
+python3 tests/regressions.py
 ```
 
 覆盖：两套原语实现全原语一致、store 全部错误路径、证书 O(1) 与断言、后备文法解析全场景、哈希链与重载、SQLite 双向篡改检测、证据逐字节等价（JSON 后端 == SQLite 导出）、快照分工、检索、批量导入幂等、5 进程并发压力、跨进程四步管线 + 灵魂样例独立断言。
+
+## v2 格式与升级边界
+
+此次修复使用 `session@v2` / `sqlite@v2`：每条事件新增 `prev_entry_hash` 和 `entry_hash`，证据封装新增 `n_ops` 和 `log_head`。两种后端生成相同的证据格式。`verify.py` 独立重算事件链，并检查重放报告的源文件摘要，拒绝沿用过期报告。
+
+**旧 v1 数据不会自动迁移或覆盖。** 当前版本拒绝把缺少完整事件链的 v1 文件当作 v2 核验。请保留原库和原证据，用对应旧版本读取/核验；需要继续使用其内容时，先导出为知识 JSONL，再用 `--session <新文件.db> import <文件.jsonl>` 建立新库。重新导入只保留知识内容，不延续旧历史的证明，不能追溯证明旧来源字段未被修改。不要直接修改格式标记，也不必 reset 旧库。
+
+修复细节与验证范围见 [docs/FIXES.md](docs/FIXES.md)。GitHub Actions 配置在 Python 3.10 / 3.14 上执行基础自检、回归测试和完整演示链。
 
 ## 限制（如实）
 
