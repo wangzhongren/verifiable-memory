@@ -1,6 +1,6 @@
 ---
 name: verifiable-memory
-description: Use when the user asks Codex to remember, recall, search, correct, or audit durable project facts across tasks using the local verifiable-memory store.
+description: Use when the user asks Codex to remember, recall, correct, or audit durable facts, or to store vector entities and derive a directed entity path with the local verifiable-memory store.
 ---
 
 # Verifiable Memory
@@ -27,3 +27,9 @@ Use the existing Python CLI with argument-safe shell quoting. Never execute memo
 ## Audit on request
 
 When the user asks to check integrity, export the bank to a fresh evidence file, run `replay.py` on that export, then run `verify.py` with the same export and replay result. Inspect exit codes and the verifier's failures. Do not overwrite an existing evidence file or claim a verification succeeded when a step failed.
+
+## Vector entities and directed actions
+
+Use this mode when the user provides entity vectors, an action increment, or a directed inference task. The CLI accepts JSON through `vector`: `teach_entity(name, vector)`, `teach_vector_action(name, delta)`, `link_entities(name, source, action, target)`, `apply_vector_action(name, source)`, and `derive_entities(name=<target>, source, max_hops?)`. Revisions use `correct_entity` and `correct_vector_action`; an old edge becomes inactive after a referenced revision changes. Read [the vector protocol](/Users/wangzhongren/code/vibeingcode/日常调研/verifiable-memory/docs/VECTOR_PROTOCOL.md) before building an operation.
+
+The numeric contract is `v(target) = v(source) + delta(action)` after 1e-6 quantization. A computed vector match is a candidate, while a `link_entities` record is a confirmed directed edge. Never infer an edge, inverse action, or semantic identity from mere vector similarity. Derivations return the ordered edge path and revisions; quote that path when explaining a result. The interface does not automatically learn that words such as “鸡” and “篮球” identify a person—such meaning needs user-provided vectors, actions, or evidence.

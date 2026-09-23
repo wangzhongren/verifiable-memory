@@ -20,6 +20,8 @@ sha256_string 两个哈希原语（哈希函数必须一致结果才可比）。
 """
 
 import argparse
+from collections import deque
+from decimal import Decimal, ROUND_HALF_EVEN
 import hashlib
 import json
 import sys
@@ -64,15 +66,85 @@ def _valid_input(s):
             and all(c in '01234567' for c in s))
 
 
-def _record_from_write(op):
+VECTOR_WRITES = {'teach_entity', 'correct_entity', 'teach_vector_action',
+                 'correct_vector_action', 'link_entities'}
+
+
+def _vector_units(values):
+    """核验器独立量化，不调用 store 或 vectors 的执行逻辑。"""
+    return [int((Decimal(str(value)) * 1_000_000).to_integral_value(
+        rounding=ROUND_HALF_EVEN)) for value in values]
+
+
+def _vector_display(units):
+    return [str(Decimal(unit) / 1_000_000) for unit in units]
+
+
+def _edge_is_current(edge, slots):
+    if edge['kind'] != 'edge':
+        return False
+    for key, kind in (('source', 'entity'), ('action', 'vector_action'),
+                      ('target', 'entity')):
+        dep = slots.get(edge[key])
+        if dep is None or dep['kind'] != kind or dep['revision'] != edge[key + '_revision']:
+            return False
+    first = slots[edge['source']]['vector_units']
+    delta = slots[edge['action']]['delta_units']
+    last = slots[edge['target']]['vector_units']
+    return len(first) == len(delta) == len(last) and all(
+        first[i] + delta[i] == last[i] for i in range(len(first)))
+
+
+def _independent_path(source, target, slots, max_hops):
+    ordered = sorted((name, rec) for name, rec in slots.items() if rec['kind'] == 'edge')
+    queue = deque([(source, [])])
+    visited = {source}
+    while queue:
+        here, path = queue.popleft()
+        if here == target:
+            return path
+        if len(path) >= max_hops:
+            continue
+        for name, edge in ordered:
+            next_name = edge['target']
+            if edge['source'] == here and next_name not in visited and _edge_is_current(edge, slots):
+                visited.add(next_name)
+                queue.append((next_name, path + [name]))
+    raise VerifyError(f'独立实现未找到有向路径：{source}→{target}')
+
+
+def _record_from_write(op, slots):
     """从 op 独立构造槽位记录（字段与 store 约定一致，但独立写出）。"""
-    kind = 'rule' if op['op'].endswith('_rule') else 'fact'
+    kind = ('fact' if op['op'].endswith('_fact') else
+            'rule' if op['op'].endswith('_rule') else
+            'entity' if op['op'].endswith('_entity') else
+            'vector_action' if op['op'].endswith('_vector_action') else 'edge')
     record = {'kind': kind, 'written_by': op['_op_id'], 'revision': op['_revision'],
               'utterance': op['_utterance']}
     if kind == 'fact':
         record['content'] = op['content']
-    else:
+    elif kind == 'rule':
         record['program'] = list(op['program'])
+    elif kind == 'entity':
+        record['vector_units'] = _vector_units(op['vector'])
+        record['vector_scale'] = 1_000_000
+    elif kind == 'vector_action':
+        record['delta_units'] = _vector_units(op['delta'])
+        record['vector_scale'] = 1_000_000
+    else:
+        for key, want in (('source', 'entity'), ('action', 'vector_action'),
+                          ('target', 'entity')):
+            ref = slots.get(op[key])
+            if ref is None or ref['kind'] != want:
+                raise VerifyError(f'有向边引用无效：{key}={op[key]}')
+            record[key] = op[key]
+            record[key + '_revision'] = ref['revision']
+        before = slots[op['source']]['vector_units']
+        delta = slots[op['action']]['delta_units']
+        after = slots[op['target']]['vector_units']
+        if len(before) != len(delta) or len(before) != len(after) or any(
+                before[i] + delta[i] != after[i] for i in range(len(before))):
+            raise VerifyError('有向边的目标向量不等于源向量加动作增量')
     return record
 
 
@@ -96,18 +168,22 @@ def independent_replay(entries, capacity):
         before = {k: dict(v) for k, v in slots.items()}
         before_slots = slot_hashes()
 
-        if entry['status'] == 'ok' and op['op'] in ('teach_fact', 'teach_rule',
-                                                    'correct_fact', 'correct_rule'):
+        if entry['status'] == 'ok' and op['op'] in ({'teach_fact', 'teach_rule',
+                                                   'correct_fact', 'correct_rule'} | VECTOR_WRITES):
             exists = op['name'] in slots
             if op['op'].startswith('teach_') and exists:
                 problems.append(f"{entry['op_id']}: teach 已存在名称 {op['name']}")
             if op['op'].startswith('correct_') and not exists:
                 problems.append(f"{entry['op_id']}: correct 不存在名称 {op['name']}")
+            if op['op'] == 'link_entities' and exists:
+                problems.append(f"{entry['op_id']}: link 已存在名称 {op['name']}")
             revision = slots[op['name']]['revision'] + 1 if exists else 1
-            op['_op_id'] = entry['op_id']
-            op['_revision'] = revision
+            op['_op_id'], op['_revision'] = entry['op_id'], revision
             op['_utterance'] = entry.get('utterance', '')
-            slots[op['name']] = _record_from_write(op)
+            try:
+                slots[op['name']] = _record_from_write(op, slots)
+            except (VerifyError, KeyError, TypeError, ValueError) as exc:
+                problems.append(f"{entry['op_id']}: 独立构建写入失败：{exc}")
         elif entry['status'] == 'error':
             # 独立重推错误：op 应在独立语义下被拒绝（粗粒度：与原错误
             # 同为拒绝即可，精确消息比对在 replay.py 已做）。
@@ -181,7 +257,7 @@ def verify(session_path, replayed_path):
     for entry in entries:
         if entry['status'] != 'ok':
             continue
-        if entry['op']['op'] in ('teach_fact', 'teach_rule', 'correct_fact', 'correct_rule') and 'proof' not in entry:
+        if entry['op']['op'] in ({'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule'} | VECTOR_WRITES) and 'proof' not in entry:
             failures.append(f"{entry['op_id']}: 成功写操作缺少证书")
         if 'proof' not in entry:
             continue
@@ -247,6 +323,82 @@ def verify(session_path, replayed_path):
                 failures.append(f"{entry['op_id']}: 答案 {recorded} ≠ 独立重算 {expected_answer}")
             if replay_answers.get(entry['op_id']) != expected_answer:
                 failures.append(f"{entry['op_id']}: replayed.json 答案与独立重算不符")
+
+    # 3b. 独立核验向量执行、实体间有向路径和修订导致的边失效。
+    indexed_states = {state[0]: state[2] for state in states}
+    for entry in entries:
+        if entry['status'] != 'ok':
+            continue
+        op = entry['op']
+        if op['op'] not in ('apply_vector_action', 'derive_entities', 'query_record'):
+            continue
+        slots = indexed_states[entry['op_id']]
+        result = entry.get('result', {})
+        try:
+            if op['op'] == 'query_record':
+                rec = slots[op['name']]
+                if rec['kind'] == 'entity':
+                    expected = {'vector': _vector_display(rec['vector_units']),
+                                'answer': _vector_display(rec['vector_units'])}
+                elif rec['kind'] == 'vector_action':
+                    expected = {'delta': _vector_display(rec['delta_units']),
+                                'answer': _vector_display(rec['delta_units'])}
+                elif rec['kind'] == 'edge':
+                    expected = {'source': rec['source'], 'action': rec['action'],
+                                'target': rec['target'],
+                                'active': _edge_is_current(rec, slots),
+                                'answer': f"{rec['source']} --{rec['action']}--> {rec['target']}"}
+                else:
+                    continue
+            elif op['op'] == 'apply_vector_action':
+                entity, action = slots[op['source']], slots[op['name']]
+                before, delta = entity['vector_units'], action['delta_units']
+                if len(before) != len(delta):
+                    raise VerifyError('向量维度不一致')
+                output = [before[i] + delta[i] for i in range(len(before))]
+                matches = sorted(n for n, rec in slots.items()
+                                 if rec['kind'] == 'entity' and rec['vector_units'] == output)
+                expected = {'source': op['source'], 'source_revision': entity['revision'],
+                            'input_vector': _vector_display(before),
+                            'delta': _vector_display(delta),
+                            'output_vector': _vector_display(output),
+                            'matches': matches, 'answer': matches}
+            else:
+                path = _independent_path(op['source'], op['name'], slots,
+                                         op.get('max_hops', 8))
+                trace = []
+                for edge_name in path:
+                    edge = slots[edge_name]
+                    left, action, right = (slots[edge['source']], slots[edge['action']],
+                                           slots[edge['target']])
+                    trace.append({'edge': edge_name, 'edge_revision': edge['revision'],
+                                  'edge_written_by': edge['written_by'],
+                                  'edge_hash': sha256_string(canonical_json(edge)),
+                                  'source': edge['source'], 'source_revision': left['revision'],
+                                  'source_written_by': left['written_by'],
+                                  'source_hash': sha256_string(canonical_json(left)),
+                                  'action': edge['action'], 'action_revision': action['revision'],
+                                  'action_written_by': action['written_by'],
+                                  'action_hash': sha256_string(canonical_json(action)),
+                                  'target': edge['target'], 'target_revision': right['revision'],
+                                  'target_written_by': right['written_by'],
+                                  'target_hash': sha256_string(canonical_json(right)),
+                                  'before': _vector_display(left['vector_units']),
+                                  'delta': _vector_display(action['delta_units']),
+                                  'after': _vector_display(right['vector_units'])})
+                expected = {'source': op['source'],
+                            'source_revision': slots[op['source']]['revision'],
+                            'trace': trace,
+                            'vector': _vector_display(slots[op['name']]['vector_units']),
+                            'answer': op['name']}
+            mismatched = sorted(key for key, value in expected.items()
+                                if result.get(key) != value)
+            if mismatched:
+                failures.append(f"{entry['op_id']}: 向量结果独立重算不一致（字段 {mismatched}）")
+            if replay_answers.get(entry['op_id']) != expected['answer']:
+                failures.append(f"{entry['op_id']}: 向量答案与重放报告不一致")
+        except (VerifyError, KeyError, TypeError, ValueError) as exc:
+            failures.append(f"{entry['op_id']}: 向量独立核验失败：{exc}")
 
     # 4. 灵魂样例（预声明，独立断言）——仅当会话含该模式时断言；
     # 真实场景的会话不含 规则07/1234，不应被 demo 专属检查误伤。

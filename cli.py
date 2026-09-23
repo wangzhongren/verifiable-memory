@@ -30,6 +30,7 @@ from verifiable_memory import data
 from verifiable_memory import parser as parser_module
 from verifiable_memory import session as session_module
 from verifiable_memory import store
+from verifiable_memory import vectors
 from verifiable_memory.llm import LLM, LLMError
 from verifiable_memory.storage import SQLITE_SUFFIXES, export_evidence
 
@@ -39,11 +40,12 @@ DEFAULT_SESSION = HERE / 'memory.db'
 
 FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 'verifiable_memory/store.py',
                   'verifiable_memory/executor.py', 'verifiable_memory/proof.py',
+                  'verifiable_memory/vectors.py',
                   'verifiable_memory/llm.py', 'verifiable_memory/parser.py',
                   'verifiable_memory/session.py', 'verifiable_memory/storage.py',
                   'verifiable_memory/__init__.py', 'cli.py',
                   'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py',
-                  'tests/llm_checks.py']
+                  'tests/llm_checks.py', 'tests/vector_checks.py']
 
 
 def _make_llm(args, allow_local=False):
@@ -89,9 +91,9 @@ def _print_entry(entry, as_json):
         return
     if entry['status'] == 'ok':
         op = entry['op']
-        if op['op'] in ('teach_fact', 'teach_rule', 'correct_fact', 'correct_rule'):
+        if op['op'] in store.WRITE_OPS:
             result = entry['result']
-            cert = proof_summary = entry.get('proof')
+            cert = entry.get('proof')
             from verifiable_memory.proof import summarize_certificate
             print(f"✓ 已写入 {result['name']}（第{result['revision']}版） · "
                   f"{summarize_certificate(cert)}")
@@ -105,6 +107,13 @@ def _print_entry(entry, as_json):
                 extra = f' · 执行 [{steps}] · 后端 {result["backend"]}'
             elif 'program' in result:
                 extra = f" · 程序 {'→'.join(result['program'])}"
+            elif result.get('kind') == 'entity_derivation':
+                path = ' → '.join(f"{t['source']} --{t['action']}[{t['edge']}]--> {t['target']}"
+                                  for t in result['trace']) or '起点即终点'
+                extra = f" · 推导 [{path}] · 向量 {result['vector']}"
+            elif result.get('kind') == 'vector_action' and 'output_vector' in result:
+                extra = (f" · 输出向量 {result['output_vector']}"
+                         f" · 候选实体 {result['matches']}")
             print(f"✓ 答案：{result['answer']} · 证据：{evidence}{extra}")
     else:
         print(f"✗ 拒绝：{entry['error']}")
@@ -120,6 +129,22 @@ def cmd_correct(args):
 
 def cmd_ask(args):
     _run_single(args, 'ask')
+
+
+def cmd_vector(args):
+    """用结构化 JSON 操作实体向量与有向边，避免口语解析改变数值。"""
+    try:
+        op = json.loads(args.operation)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f'向量操作不是合法 JSON：{exc}') from exc
+    session = _load_or_create(args.session, capacity=args.capacity)
+    try:
+        entry = session.apply(op, category='vector', source='vector-json',
+                              utterance=args.operation)
+    finally:
+        session.close()
+    _print_entry(entry, args.json)
+    sys.exit(0 if entry['status'] == 'ok' else 1)
 
 
 def _run_single(args, category):
@@ -170,9 +195,19 @@ def cmd_status(args):
             if slot['kind'] == 'fact':
                 print(f"  [事实] {slot['name']} · 第{rec['revision']}版 · "
                       f"{rec['written_by']} · {rec['content']}")
-            else:
+            elif slot['kind'] == 'rule':
                 print(f"  [规则] {slot['name']} · 第{rec['revision']}版 · "
                       f"{rec['written_by']} · {'→'.join(rec['program'])}")
+            elif slot['kind'] == 'entity':
+                print(f"  [实体] {slot['name']} · 第{rec['revision']}版 · "
+                      f"{rec['written_by']} · {len(rec['vector_units'])}维向量")
+            elif slot['kind'] == 'vector_action':
+                print(f"  [向量动作] {slot['name']} · 第{rec['revision']}版 · "
+                      f"{rec['written_by']} · {len(rec['delta_units'])}维增量")
+            else:
+                active = '有效' if vectors.active_edge(slot['name'], rec, session.store.slots) else '已失效'
+                print(f"  [有向边] {slot['name']} · 第{rec['revision']}版 · "
+                      f"{rec['source']} --{rec['action']}--> {rec['target']} · {active}")
     finally:
         session.close()
 
@@ -187,8 +222,10 @@ def cmd_search(args):
         q = args.query.lower()
         hits = []
         for name, rec in session.store.slots.items():
-            text = name + ' ' + (rec['content'] if rec['kind'] == 'fact'
-                                 else '→'.join(rec['program']))
+            text = name + ' ' + (
+                rec['content'] if rec['kind'] == 'fact' else
+                '→'.join(rec['program']) if rec['kind'] == 'rule' else
+                f"{rec['source']} {rec['action']} {rec['target']}" if rec['kind'] == 'edge' else '')
             if q in text.lower():
                 hits.append((name, rec))
         if not hits:
@@ -198,9 +235,11 @@ def cmd_search(args):
             if rec['kind'] == 'fact':
                 print(f"  [事实] {name} · 第{rec['revision']}版 · "
                       f"{rec['written_by']} · {rec['content']}")
-            else:
+            elif rec['kind'] == 'rule':
                 print(f"  [规则] {name} · 第{rec['revision']}版 · "
                       f"{rec['written_by']} · {'→'.join(rec['program'])}")
+            else:
+                print(f"  [{rec['kind']}] {name} · 第{rec['revision']}版")
         print(f"共 {len(hits)} 处匹配")
     finally:
         session.close()
@@ -522,6 +561,9 @@ def main():
         if name == 'search':
             p.add_argument('query', help='关键词（名称与内容的子串匹配）')
         p.set_defaults(func=fn)
+    p = sub.add_parser('vector', help='实体向量、有向动作及多步推导（JSON op）')
+    p.add_argument('operation', help='结构化 JSON 操作')
+    p.set_defaults(func=cmd_vector)
     args = ap.parse_args()
     args.func(args)
 

@@ -64,7 +64,11 @@ def replay(entries, capacity):
             store.validate_op(op, content_max=200 if legacy_content_error else None)
             allowed = {'teach': {'teach_fact', 'teach_rule'},
                        'correct': {'correct_fact', 'correct_rule'},
-                       'ask': {'query_record', 'apply_rule'}}
+                       'ask': {'query_record', 'apply_rule'},
+                       'vector': {'teach_entity', 'correct_entity',
+                                  'teach_vector_action', 'correct_vector_action',
+                                  'link_entities', 'apply_vector_action',
+                                  'derive_entities', 'query_record'}}
             if op['op'] not in allowed.get(entry['category'], set()):
                 raise store.StoreError(
                     f"命令类别 {entry['category']} 不允许 op {op['op']}")

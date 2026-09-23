@@ -17,14 +17,17 @@ import hashlib
 import json
 
 from . import data
+from . import vectors
 
 STATE_FORMAT = 'verifiable_memory_01/state@v1'
 # 默认 256，建库时可指定更大的正整数；容量写入状态哈希，创建后固定。
 # 实际规模受内存、磁盘、O(N) 状态哈希与解析上下文成本限制。
 CAPACITY_DEFAULT = 256
 
-WRITE_OPS = {'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule'}
-READ_OPS = {'query_record', 'apply_rule'}
+WRITE_OPS = {'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule',
+             'teach_entity', 'correct_entity',
+             'teach_vector_action', 'correct_vector_action', 'link_entities'}
+READ_OPS = {'query_record', 'apply_rule', 'apply_vector_action', 'derive_entities'}
 ALL_OPS = WRITE_OPS | READ_OPS
 
 NAME_MAX = 24
@@ -78,6 +81,28 @@ def validate_op(op, *, content_max=None):
     elif kind == 'apply_rule':
         if not data.is_input_string(op.get('input')):
             raise StoreError(f'input 必须是 {data.MIN_LEN}–{data.MAX_LEN} 位、字符属 0–7 的数字串')
+    elif kind in ('teach_entity', 'correct_entity'):
+        try:
+            vectors.quantize(op.get('vector'))
+        except vectors.VectorError as exc:
+            raise StoreError(str(exc)) from exc
+    elif kind in ('teach_vector_action', 'correct_vector_action'):
+        try:
+            vectors.quantize(op.get('delta'), 'delta')
+        except vectors.VectorError as exc:
+            raise StoreError(str(exc)) from exc
+    elif kind == 'link_entities':
+        for field in ('source', 'action', 'target'):
+            value = op.get(field)
+            if not isinstance(value, str) or not 1 <= len(value) <= NAME_MAX:
+                raise StoreError(f'{field} 必须是 1–{NAME_MAX} 字的名称')
+    elif kind in ('apply_vector_action', 'derive_entities'):
+        if not isinstance(op.get('source'), str) or not 1 <= len(op['source']) <= NAME_MAX:
+            raise StoreError(f'source 必须是 1–{NAME_MAX} 字的实体名称')
+        if kind == 'derive_entities':
+            hops = op.get('max_hops', 8)
+            if type(hops) is not int or not 1 <= hops <= 16:
+                raise StoreError('max_hops 必须是 1–16 的整数')
     return op
 
 
@@ -124,7 +149,7 @@ class Store:
         before_state_hash = self.state_hash()
         existing = self.slots.get(name)
 
-        if kind in ('teach_fact', 'teach_rule'):
+        if kind.startswith('teach_') or kind == 'link_entities':
             if existing is not None:
                 raise StoreError(f'名称已存在：{name}（更新请用 correct_*）')
             if len(self.slots) >= self.capacity:
@@ -136,19 +161,47 @@ class Store:
             if existing is None:
                 known = '、'.join(sorted(self.slots)) or '（空）'
                 raise StoreError(f'名称不存在：{name}（已知槽位: {known}）')
-            want_kind = 'fact' if kind == 'correct_fact' else 'rule'
+            want_kind = {'correct_fact': 'fact', 'correct_rule': 'rule',
+                         'correct_entity': 'entity',
+                         'correct_vector_action': 'vector_action'}[kind]
             if existing['kind'] != want_kind:
                 raise StoreError(f'种类不符：{name} 是 {existing["kind"]}，不能用 {kind} 纠错')
             revision = existing['revision'] + 1
             created = False
             target_hash_before = state_digest(existing)
 
-        if kind in ('teach_fact', 'correct_fact'):
-            record = {'kind': 'fact', 'content': op['content'], 'written_by': op_id,
-                      'revision': revision, 'utterance': utterance}
+        record = {'kind': ('fact' if kind.endswith('_fact') else
+                           'rule' if kind.endswith('_rule') else
+                           'entity' if kind.endswith('_entity') else
+                           'vector_action' if kind.endswith('_vector_action') else 'edge'),
+                  'written_by': op_id, 'revision': revision, 'utterance': utterance}
+        if record['kind'] == 'fact':
+            record['content'] = op['content']
+        elif record['kind'] == 'rule':
+            record['program'] = list(op['program'])
+        elif record['kind'] == 'entity':
+            record['vector_units'] = vectors.quantize(op['vector'])
+            record['vector_scale'] = vectors.SCALE
+        elif record['kind'] == 'vector_action':
+            record['delta_units'] = vectors.quantize(op['delta'], 'delta')
+            record['vector_scale'] = vectors.SCALE
         else:
-            record = {'kind': 'rule', 'program': list(op['program']), 'written_by': op_id,
-                      'revision': revision, 'utterance': utterance}
+            refs = {}
+            for key, want in (('source', 'entity'), ('action', 'vector_action'),
+                              ('target', 'entity')):
+                ref = self.slots.get(op[key])
+                if ref is None or ref['kind'] != want:
+                    raise StoreError(f'{key} 必须引用已有的 {want}：{op[key]}')
+                refs[key + '_revision'] = ref['revision']
+            a = self.slots[op['source']]['vector_units']
+            delta = self.slots[op['action']]['delta_units']
+            b = self.slots[op['target']]['vector_units']
+            if len(a) != len(delta) or len(a) != len(b):
+                raise StoreError('实体与动作向量维度不一致')
+            if any(x + d != y for x, d, y in zip(a, delta, b)):
+                raise StoreError('目标向量不等于源向量加动作增量')
+            record.update({key: op[key] for key in ('source', 'action', 'target')})
+            record.update(refs)
         self.slots[name] = record
 
         return proof.write_certificate(
@@ -175,10 +228,21 @@ class Store:
             if record['kind'] == 'fact':
                 result['content'] = record['content']
                 result['answer'] = record['content']
-            else:
+            elif record['kind'] == 'rule':
                 result['program'] = record['program']
                 result['answer'] = '→'.join(record['program'])
-        else:  # apply_rule
+            elif record['kind'] == 'entity':
+                result['vector'] = vectors.display(record['vector_units'])
+                result['answer'] = result['vector']
+            elif record['kind'] == 'vector_action':
+                result['delta'] = vectors.display(record['delta_units'])
+                result['answer'] = result['delta']
+            else:
+                result['source'], result['action'], result['target'] = (
+                    record['source'], record['action'], record['target'])
+                result['active'] = vectors.active_edge(name, record, self.slots)
+                result['answer'] = f"{record['source']} --{record['action']}--> {record['target']}"
+        elif kind == 'apply_rule':
             if record['kind'] != 'rule':
                 raise StoreError(f'{name} 是事实记录，不能作为规则执行')
             from . import executor
@@ -187,6 +251,61 @@ class Store:
                       'written_by': record['written_by'], 'revision': record['revision'],
                       'program': record['program'], 'backend': run['backend'],
                       'trace': run['trace'], 'answer': run['answer']}
+        elif kind == 'apply_vector_action':
+            if record['kind'] != 'vector_action':
+                raise StoreError(f'{name} 不是向量动作')
+            entity = self.slots.get(op['source'])
+            if entity is None or entity['kind'] != 'entity':
+                raise StoreError(f'source 必须引用已有实体：{op["source"]}')
+            source_units, delta = entity['vector_units'], record['delta_units']
+            if len(source_units) != len(delta):
+                raise StoreError('实体与动作向量维度不一致')
+            output_units = [x + d for x, d in zip(source_units, delta)]
+            matches = sorted(n for n, rec in self.slots.items()
+                             if rec['kind'] == 'entity' and rec['vector_units'] == output_units)
+            result = {'name': name, 'kind': 'vector_action',
+                      'written_by': record['written_by'], 'revision': record['revision'],
+                      'source': op['source'], 'source_revision': entity['revision'],
+                      'input_vector': vectors.display(source_units),
+                      'delta': vectors.display(delta),
+                      'output_vector': vectors.display(output_units),
+                      'matches': matches, 'answer': matches}
+        else:  # derive_entities：name 为目标实体
+            if record['kind'] != 'entity':
+                raise StoreError(f'{name} 不是实体')
+            source = self.slots.get(op['source'])
+            if source is None or source['kind'] != 'entity':
+                raise StoreError(f'source 必须引用已有实体：{op["source"]}')
+            try:
+                path = vectors.derive(op['source'], name, self.slots, op.get('max_hops', 8))
+            except vectors.VectorError as exc:
+                raise StoreError(str(exc)) from exc
+            trace = []
+            for edge_name in path:
+                edge = self.slots[edge_name]
+                left, action, right = (self.slots[edge['source']],
+                                       self.slots[edge['action']],
+                                       self.slots[edge['target']])
+                trace.append({'edge': edge_name, 'edge_revision': edge['revision'],
+                              'edge_written_by': edge['written_by'],
+                              'edge_hash': state_digest(edge),
+                              'source': edge['source'], 'source_revision': left['revision'],
+                              'source_written_by': left['written_by'],
+                              'source_hash': state_digest(left),
+                              'action': edge['action'], 'action_revision': action['revision'],
+                              'action_written_by': action['written_by'],
+                              'action_hash': state_digest(action),
+                              'target': edge['target'], 'target_revision': right['revision'],
+                              'target_written_by': right['written_by'],
+                              'target_hash': state_digest(right),
+                              'before': vectors.display(left['vector_units']),
+                              'delta': vectors.display(action['delta_units']),
+                              'after': vectors.display(right['vector_units'])})
+            result = {'name': name, 'kind': 'entity_derivation',
+                      'written_by': record['written_by'], 'revision': record['revision'],
+                      'source': op['source'], 'source_revision': source['revision'],
+                      'trace': trace, 'vector': vectors.display(record['vector_units']),
+                      'answer': name}
 
         result['slot_hash'] = state_digest(record)
         result['state_hash'] = self.state_hash()

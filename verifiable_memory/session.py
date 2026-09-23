@@ -30,6 +30,9 @@ CATEGORIES = {
     'teach': {'teach_fact', 'teach_rule'},
     'correct': {'correct_fact', 'correct_rule'},
     'ask': store.READ_OPS,
+    'vector': {'teach_entity', 'correct_entity', 'teach_vector_action',
+               'correct_vector_action', 'link_entities',
+               'apply_vector_action', 'derive_entities', 'query_record'},
 }
 
 
@@ -207,9 +210,9 @@ class Session:
                 raise store.StoreError(f"命令类别 {category} 不允许 op {op['op']}")
             if op['op'] in store.WRITE_OPS:
                 cert = self.store.apply_write(op, op_id=op_id, utterance=utterance)
-                entry['result'] = {'name': op['name'],
-                                   'kind': 'rule' if op['op'].endswith('_rule') else 'fact',
-                                   'revision': self.store.slots[op['name']]['revision'],
+                record = self.store.slots[op['name']]
+                entry['result'] = {'name': op['name'], 'kind': record['kind'],
+                                   'revision': record['revision'],
                                    'written_by': op_id}
                 entry['proof'] = cert
                 mutated = (op['name'], self.store.slots[op['name']])

@@ -8,7 +8,7 @@
 
 ## English TL;DR
 
-- **What it is**: a small, pure-stdlib Python memory system for LLM agents. Natural language goes in at the edges; inside the verification boundary there are only six deterministic structured operations over named slots (facts + executable rules).
+- **What it is**: a small, pure-stdlib Python memory system for LLM agents. The original six structured operations teach facts and executable rules; a new vector interface adds typed entities, reusable directed actions, revision-pinned edges, and independently checked path derivation.
 - **Why it's different**: the LLM stays **upstream of a structured verification boundary**. Accepted operations are deterministic and auditable. Schema checks cannot establish factual truth or correct interpretation; parser failures occur before the operation log.
 - **Guarantees**: SHA-256 hash-chained op log · **zero-collateral-write certificates** (editing slot A provably leaves slots B..N untouched) · **bit-exact replay** from the log alone · a **second independent implementation** of the primitives that must agree · tamper detection · SQLite working store + canonical JSON evidence export.
 - **Requirements**: Python 3.10+ (no third-party packages). One command installs nothing; one file (SQLite) is the whole memory.
@@ -38,7 +38,7 @@ LLM agent 的"记忆"通常是一条越来越长的 prompt，或一个向量库�
                                             replay.py 独立进程重放 · verify.py 第二套实现独立核验
 ```
 
-六种结构化操作（边界内只有这些）：`teach_fact / teach_rule / correct_fact / correct_rule / query_record / apply_rule`。规则由四个原语组成：`反转 / 左移一位 / 交换前两位 / 首位加一`（首位加一按模 8），作用于 2–8 位、每位 0–7 的数字串。
+原始场景的六种结构化操作：`teach_fact / teach_rule / correct_fact / correct_rule / query_record / apply_rule`。数字串规则由四个原语组成：`反转 / 左移一位 / 交换前两位 / 首位加一`（首位加一按模 8），作用于 2–8 位、每位 0–7 的数字串。实体向量与有向动作是独立的扩展，见下文。
 
 ## 快速开始
 
@@ -147,6 +147,10 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 - **不能抓**：能重写日志并重算链及元数据的攻击者；也无法识别完整旧版本的回滚或同时改写计数和链头的尾部截断（需要外部可信锚）。工作路径对"检查点之前"的日志段有意只做轻校验（快照锚 + 尾部重放），全量重放核验是 `replay.py`/`verify.py` 的离线职责——数据库工程的 WAL/checkpoint 分工，不是漏洞。
 - **并发**：多进程写入走乐观协议（落库前核对链头，被抢先则重载重试）；5 进程真并发压力测试在 `checks.py`。
 
+## 实体向量与有向动作
+
+现在可以把实体存为向量，把动作存为可复用的向量增量，并记录 `A --动作--> B`。只有量化后 `v(B) = v(A) + Δ(动作)` 才能建边；多步推导返回每一步的实体、动作、向量和修订证据。实体或动作被更正时，引用旧修订的边自动退出当前推导，但历史记录不消失。CLI 使用结构化 JSON `vector` 子命令，Python 使用 `Session.apply(..., category="vector")`。这适用于明确定义了向量和动作的系统，不会自动学出“鸡与篮球指向蔡徐坤”这类语义关系。完整语义、操作示例和边界见 [docs/VECTOR_PROTOCOL.md](docs/VECTOR_PROTOCOL.md)。
+
 ## 规模化
 
 默认 256 个命名槽位，建库时可用 `--capacity` 指定更大的正整数，代码没有另设固定总量上限。例如 `python3 cli.py --session large-memory.db --capacity 32000 status` 创建一个 32k 容量的新库。容量写入状态哈希，现有库不会自动扩容；需要更大容量时，应保留原库和历史证据，再将知识导入新库。实际规模受内存、磁盘和性能限制，不等于无限存储。
@@ -164,6 +168,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 │   ├── data.py       # 四原语参考实现 + 预声明场景
 │   ├── store.py      # 命名槽位、精确寻址、op 白名单、canonical JSON + sha256
 │   ├── executor.py   # 执行器接口 + 符号后端（逐步 trace，失败即抛错）
+│   ├── vectors.py    # 固定点向量、有效有向边和多步路径推导
 │   ├── proof.py      # 零附带损害证书（v2 O(1)；v1 全表格式兼容读取）
 │   ├── parser.py     # NL→op：LLM 结构化输出（白名单）+ 无 key 后备文法
 │   ├── llm.py        # 本地配置 + OpenAI/Anthropic 调用（urllib；温度 0）
@@ -171,6 +176,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 │   └── storage.py    # SQLite 工作存储（ops 只追加 + state 缓存 + 检查点）；JSON 证据格式
 ├── tests/checks.py                   # 基础自检（含真子进程并发压力与篡改测试）
 ├── tests/regressions.py              # 检查点边界、完整事件链和事务回滚回归测试
+├── tests/vector_checks.py            # 向量实体、方向、修订失效与独立推导测试
 ├── tests/llm_checks.py               # 本地 HTTP 服务验证协议、配置和 CLI；无需真实密钥
 ├── docs/PROTOCOL.md                  # 预声明的验收标准与期望值（先冻结后执行）
 ├── docs/REPORT.md                    # 研发记录：验收结果、机制事实、抓到的 bug
@@ -184,6 +190,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 ```bash
 python3 tests/checks.py
 python3 tests/regressions.py
+python3 tests/vector_checks.py
 python3 tests/llm_checks.py
 ```
 
