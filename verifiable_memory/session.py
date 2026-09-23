@@ -29,10 +29,11 @@ from .store import CAPACITY_DEFAULT, state_digest
 CATEGORIES = {
     'teach': {'teach_fact', 'teach_rule'},
     'correct': {'correct_fact', 'correct_rule'},
-    'ask': store.READ_OPS,
+    'ask': {'query_record', 'apply_rule'},
     'vector': {'teach_entity', 'correct_entity', 'teach_vector_action',
                'correct_vector_action', 'link_entities',
                'apply_vector_action', 'derive_entities', 'query_record'},
+    'policy': {'route_entities'},
 }
 
 

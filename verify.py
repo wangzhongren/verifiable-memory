@@ -330,7 +330,8 @@ def verify(session_path, replayed_path):
         if entry['status'] != 'ok':
             continue
         op = entry['op']
-        if op['op'] not in ('apply_vector_action', 'derive_entities', 'query_record'):
+        if op['op'] not in ('apply_vector_action', 'derive_entities',
+                            'route_entities', 'query_record'):
             continue
         slots = indexed_states[entry['op_id']]
         result = entry.get('result', {})
@@ -364,11 +365,16 @@ def verify(session_path, replayed_path):
                             'output_vector': _vector_display(output),
                             'matches': matches, 'answer': matches}
             else:
-                path = _independent_path(op['source'], op['name'], slots,
-                                         op.get('max_hops', 8))
+                path = (_independent_path(op['source'], op['name'], slots,
+                                          op.get('max_hops', 8))
+                        if op['op'] == 'derive_entities' else op['path'])
                 trace = []
+                current = op['source']
                 for edge_name in path:
                     edge = slots[edge_name]
+                    if edge['source'] != current or not _edge_is_current(edge, slots):
+                        raise VerifyError(f'策略路径使用无效或反向边：{edge_name}')
+                    current = edge['target']
                     left, action, right = (slots[edge['source']], slots[edge['action']],
                                            slots[edge['target']])
                     trace.append({'edge': edge_name, 'edge_revision': edge['revision'],
@@ -386,11 +392,23 @@ def verify(session_path, replayed_path):
                                   'before': _vector_display(left['vector_units']),
                                   'delta': _vector_display(action['delta_units']),
                                   'after': _vector_display(right['vector_units'])})
+                if current != op['name']:
+                    raise VerifyError(f'策略路径终点 {current} 与目标 {op["name"]} 不符')
                 expected = {'source': op['source'],
                             'source_revision': slots[op['source']]['revision'],
                             'trace': trace,
                             'vector': _vector_display(slots[op['name']]['vector_units']),
-                            'answer': op['name']}
+                            'answer': (None if op['op'] == 'route_entities'
+                                       and op['abstained'] else op['name'])}
+                if op['op'] == 'route_entities':
+                    if any(op['decisions'][i]['choice'] != edge
+                           for i, edge in enumerate(path)):
+                        raise VerifyError('策略决策与选中边不一致')
+                    expected.update({'query': op['query'],
+                                     'policy_sha256': op['policy_sha256'],
+                                     'decisions': op['decisions'],
+                                     'abstained': op['abstained'],
+                                     'reason': op['reason']})
             mismatched = sorted(key for key, value in expected.items()
                                 if result.get(key) != value)
             if mismatched:

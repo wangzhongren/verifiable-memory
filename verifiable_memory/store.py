@@ -15,6 +15,7 @@ sha256_string（哈希函数必须一致结果才可比，这是刻意保留的�
 
 import hashlib
 import json
+import re
 
 from . import data
 from . import vectors
@@ -27,7 +28,8 @@ CAPACITY_DEFAULT = 256
 WRITE_OPS = {'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule',
              'teach_entity', 'correct_entity',
              'teach_vector_action', 'correct_vector_action', 'link_entities'}
-READ_OPS = {'query_record', 'apply_rule', 'apply_vector_action', 'derive_entities'}
+READ_OPS = {'query_record', 'apply_rule', 'apply_vector_action',
+            'derive_entities', 'route_entities'}
 ALL_OPS = WRITE_OPS | READ_OPS
 
 NAME_MAX = 24
@@ -96,13 +98,39 @@ def validate_op(op, *, content_max=None):
             value = op.get(field)
             if not isinstance(value, str) or not 1 <= len(value) <= NAME_MAX:
                 raise StoreError(f'{field} 必须是 1–{NAME_MAX} 字的名称')
-    elif kind in ('apply_vector_action', 'derive_entities'):
+    elif kind in ('apply_vector_action', 'derive_entities', 'route_entities'):
         if not isinstance(op.get('source'), str) or not 1 <= len(op['source']) <= NAME_MAX:
             raise StoreError(f'source 必须是 1–{NAME_MAX} 字的实体名称')
-        if kind == 'derive_entities':
+        if kind in ('derive_entities', 'route_entities'):
             hops = op.get('max_hops', 8)
             if type(hops) is not int or not 1 <= hops <= 16:
                 raise StoreError('max_hops 必须是 1–16 的整数')
+        if kind == 'route_entities':
+            path = op.get('path')
+            if (not isinstance(path, list) or len(path) > hops
+                    or not all(isinstance(name, str) and 1 <= len(name) <= NAME_MAX
+                               for name in path)):
+                raise StoreError('path 必须是不超过 max_hops 的有向边名称列表')
+            if not isinstance(op.get('query'), str) or not 1 <= len(op['query']) <= 500:
+                raise StoreError('query 必须是 1–500 字的字符串')
+            if (not isinstance(op.get('policy_sha256'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', op['policy_sha256'])):
+                raise StoreError('policy_sha256 必须是模型文件的 SHA-256')
+            if type(op.get('abstained')) is not bool or op.get('reason') not in (
+                    'leaf', 'no_edges', 'uncertain', 'cycle_limit', 'max_hops'):
+                raise StoreError('缺少有效的 abstained / reason')
+            decisions = op.get('decisions')
+            if not isinstance(decisions, list) or len(decisions) not in (len(path), len(path) + 1):
+                raise StoreError('decisions 数量与 path 不符')
+            if not all(isinstance(d, dict) and isinstance(d.get('source'), str)
+                       and (d.get('choice') is None or isinstance(d.get('choice'), str))
+                       and isinstance(d.get('candidates'), list)
+                       for d in decisions):
+                raise StoreError('decisions 格式不符')
+            if any(decisions[i]['choice'] != path[i] for i in range(len(path))):
+                raise StoreError('decisions 与 path 选中边不符')
+            if len(decisions) > len(path) and decisions[-1]['choice'] is not None:
+                raise StoreError('最后一次未选中边的决策必须弃权')
     return op
 
 
@@ -270,19 +298,27 @@ class Store:
                       'delta': vectors.display(delta),
                       'output_vector': vectors.display(output_units),
                       'matches': matches, 'answer': matches}
-        else:  # derive_entities：name 为目标实体
+        else:  # derive_entities / route_entities：name 为目标实体
             if record['kind'] != 'entity':
                 raise StoreError(f'{name} 不是实体')
             source = self.slots.get(op['source'])
             if source is None or source['kind'] != 'entity':
                 raise StoreError(f'source 必须引用已有实体：{op["source"]}')
-            try:
-                path = vectors.derive(op['source'], name, self.slots, op.get('max_hops', 8))
-            except vectors.VectorError as exc:
-                raise StoreError(str(exc)) from exc
+            if kind == 'derive_entities':
+                try:
+                    path = vectors.derive(op['source'], name, self.slots, op.get('max_hops', 8))
+                except vectors.VectorError as exc:
+                    raise StoreError(str(exc)) from exc
+            else:
+                path = op['path']
             trace = []
+            current = op['source']
             for edge_name in path:
-                edge = self.slots[edge_name]
+                edge = self.slots.get(edge_name)
+                if (edge is None or edge['kind'] != 'edge' or edge['source'] != current
+                        or not vectors.active_edge(edge_name, edge, self.slots)):
+                    raise StoreError(f'策略路径包含无效或反向边：{edge_name}')
+                current = edge['target']
                 left, action, right = (self.slots[edge['source']],
                                        self.slots[edge['action']],
                                        self.slots[edge['target']])
@@ -301,11 +337,19 @@ class Store:
                               'before': vectors.display(left['vector_units']),
                               'delta': vectors.display(action['delta_units']),
                               'after': vectors.display(right['vector_units'])})
+            if current != name:
+                raise StoreError(f'路径终点 {current} 与目标实体 {name} 不符')
             result = {'name': name, 'kind': 'entity_derivation',
                       'written_by': record['written_by'], 'revision': record['revision'],
                       'source': op['source'], 'source_revision': source['revision'],
                       'trace': trace, 'vector': vectors.display(record['vector_units']),
                       'answer': name}
+            if kind == 'route_entities':
+                result.update({'kind': 'policy_route',
+                               'query': op['query'], 'policy_sha256': op['policy_sha256'],
+                               'decisions': op['decisions'], 'abstained': op['abstained'],
+                               'reason': op['reason'],
+                               'answer': None if op['abstained'] else name})
 
         result['slot_hash'] = state_digest(record)
         result['state_hash'] = self.state_hash()

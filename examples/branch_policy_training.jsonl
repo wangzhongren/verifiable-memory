@@ -1,0 +1,13 @@
+{"source":"A","query":"向右然后向上","edge":"AB"}
+{"source":"A","query":"先右后上","edge":"AB"}
+{"source":"A","query":"从A向右","edge":"AB"}
+{"source":"A","query":"向上","edge":"AD"}
+{"source":"A","query":"只向上","edge":"AD"}
+{"source":"A","query":"上移","edge":"AD"}
+{"source":"A","query":"无关请求","edge":null}
+{"source":"A","query":"不要移动","edge":null}
+{"source":"B","query":"向右然后向上","edge":"BC"}
+{"source":"B","query":"先右后上","edge":"BC"}
+{"source":"B","query":"从B向上","edge":"BC"}
+{"source":"B","query":"无关请求","edge":null}
+{"source":"B","query":"不要移动","edge":null}

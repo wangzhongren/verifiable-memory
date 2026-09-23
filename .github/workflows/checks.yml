@@ -28,6 +28,8 @@ jobs:
         run: python tests/llm_checks.py
       - name: Directed vector entity and inference checks
         run: python tests/vector_checks.py
+      - name: Trainable branch controller checks
+        run: python tests/policy_checks.py
       - name: Frozen demo
         run: python cli.py script
       - name: Replay demo

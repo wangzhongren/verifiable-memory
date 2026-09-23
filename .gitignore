@@ -9,6 +9,7 @@ import_demo.db
 import_demo.db-wal
 import_demo.db-shm
 *.db-journal
+*.policy.json
 
 # 会话/证据导出（可再生：cli.py export）
 *.session.json

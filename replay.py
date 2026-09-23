@@ -69,6 +69,7 @@ def replay(entries, capacity):
                                   'teach_vector_action', 'correct_vector_action',
                                   'link_entities', 'apply_vector_action',
                                   'derive_entities', 'query_record'}}
+            allowed['policy'] = {'route_entities'}
             if op['op'] not in allowed.get(entry['category'], set()):
                 raise store.StoreError(
                     f"命令类别 {entry['category']} 不允许 op {op['op']}")

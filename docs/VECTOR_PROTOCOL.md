@@ -30,3 +30,5 @@ python3 cli.py --session graph.db --json vector '{"op":"derive_entities","source
 `name` 是推导目标。单步候选查询为 `{"op":"apply_vector_action","name":"向右","source":"A"}`。读取实体、动作或边可用 `{"op":"query_record","name":"A"}`。更正用 `correct_entity` 加 `vector`，或 `correct_vector_action` 加 `delta`。Python 调用方可以把同样的字典交给 `Session.apply(op, category="vector", source=..., utterance=...)`。无需模型解析这些 JSON 参数。
 
 日常数据存 SQLite，写入与错误进入原有操作日志和哈希链。`export` → `replay.py` → `verify.py` 可独立重建与复核实体记录、有向边、动作结果和推导路径。规则正确性在**声明的数值变换与边关系内**可核验；向量相似性、语义实体识别、自动学习动作、来源真实性都不由这套数值证明自动解决。例如“鸡 + 篮球联想到蔡徐坤”需要额外的语义映射或明确来源，不能靠任意两段普通 embedding 向量相加来保证。
+
+需要让模型根据查询和当前实体自行选择下一条边时，使用 [可训练分叉控制器](POLICY_TRAINING.md)；数值内核继续独立检查它选出的路径。

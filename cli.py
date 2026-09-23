@@ -22,12 +22,14 @@
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from verifiable_memory import data
 from verifiable_memory import parser as parser_module
+from verifiable_memory import policy as policy_module
 from verifiable_memory import session as session_module
 from verifiable_memory import store
 from verifiable_memory import vectors
@@ -41,11 +43,13 @@ DEFAULT_SESSION = HERE / 'memory.db'
 FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 'verifiable_memory/store.py',
                   'verifiable_memory/executor.py', 'verifiable_memory/proof.py',
                   'verifiable_memory/vectors.py',
+                  'verifiable_memory/policy.py',
                   'verifiable_memory/llm.py', 'verifiable_memory/parser.py',
                   'verifiable_memory/session.py', 'verifiable_memory/storage.py',
                   'verifiable_memory/__init__.py', 'cli.py',
                   'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py',
-                  'tests/llm_checks.py', 'tests/vector_checks.py']
+                  'tests/llm_checks.py', 'tests/vector_checks.py',
+                  'tests/policy_checks.py']
 
 
 def _make_llm(args, allow_local=False):
@@ -111,10 +115,16 @@ def _print_entry(entry, as_json):
                 path = ' → '.join(f"{t['source']} --{t['action']}[{t['edge']}]--> {t['target']}"
                                   for t in result['trace']) or '起点即终点'
                 extra = f" · 推导 [{path}] · 向量 {result['vector']}"
+            elif result.get('kind') == 'policy_route':
+                path = ' → '.join(t['edge'] for t in result['trace']) or '未选择边'
+                extra = (f" · 策略 {result['policy_sha256'][:12]} · 路径 [{path}]"
+                         f" · {'弃权' if result['abstained'] else '完成'}: {result['reason']}")
             elif result.get('kind') == 'vector_action' and 'output_vector' in result:
                 extra = (f" · 输出向量 {result['output_vector']}"
                          f" · 候选实体 {result['matches']}")
-            print(f"✓ 答案：{result['answer']} · 证据：{evidence}{extra}")
+            answer = ('未判定' if result.get('kind') == 'policy_route'
+                      and result['abstained'] else result['answer'])
+            print(f"✓ 答案：{answer} · 证据：{evidence}{extra}")
     else:
         print(f"✗ 拒绝：{entry['error']}")
 
@@ -145,6 +155,86 @@ def cmd_vector(args):
         session.close()
     _print_entry(entry, args.json)
     sys.exit(0 if entry['status'] == 'ok' else 1)
+
+
+def cmd_policy_train(args):
+    """从带标签的分叉 JSONL 训练小策略模型；不改动记忆库。"""
+    out = Path(args.out)
+    if out.exists():
+        raise SystemExit(f'拒绝覆盖模型文件：{out}')
+    try:
+        rows = [json.loads(line) for line in Path(args.data).read_text(encoding='utf-8').splitlines()
+                if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'训练数据读取失败：{exc}') from exc
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'训练需要已有实体图：{exc}') from exc
+    try:
+        model = policy_module.train(rows, session.store.slots)
+    except policy_module.PolicyError as exc:
+        raise SystemExit(f'训练失败：{exc}') from exc
+    finally:
+        session.close()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = store.canonical_json(model) + '\n'
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as target:
+        target.write(text)
+    print(f'模型已训练：{len(rows)} 条标注 · 图指纹 {model["graph_signature"][:12]}'
+          f' · 文件 {out}')
+
+
+def cmd_policy_route(args):
+    """逐节点自主选择分支，再让 Store 验证选中路径与向量运算。"""
+    try:
+        model_bytes = Path(args.model).read_bytes()
+        model = json.loads(model_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'模型文件读取失败：{exc}') from exc
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'策略路由需要已有实体图：{exc}') from exc
+    try:
+        decision = policy_module.route(model, args.query, args.source,
+                                       session.store.slots, args.max_hops)
+        op = {'op': 'route_entities', 'name': decision['target'],
+              'source': args.source, 'query': args.query,
+              'path': decision['path'], 'decisions': decision['decisions'],
+              'abstained': decision['abstained'], 'reason': decision['reason'],
+              'max_hops': args.max_hops,
+              'policy_sha256': hashlib.sha256(model_bytes).hexdigest()}
+        entry = session.apply(op, category='policy', source='trained-policy',
+                              utterance=args.query)
+    except (policy_module.PolicyError, session_module.SessionError) as exc:
+        raise SystemExit(f'策略路由失败：{exc}') from exc
+    finally:
+        session.close()
+    _print_entry(entry, args.json)
+    sys.exit(1 if entry['status'] == 'error' else 2 if decision['abstained'] else 0)
+
+
+def cmd_policy_eval(args):
+    """用独立标注集报告首步选边与弃权，不改动图或日志。"""
+    try:
+        model = json.loads(Path(args.model).read_text(encoding='utf-8'))
+        rows = [json.loads(line) for line in Path(args.data).read_text(encoding='utf-8').splitlines()
+                if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'评估输入读取失败：{exc}') from exc
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'评估需要已有实体图：{exc}') from exc
+    try:
+        result = policy_module.evaluate(model, rows, session.store.slots)
+    except policy_module.PolicyError as exc:
+        raise SystemExit(f'评估失败：{exc}') from exc
+    finally:
+        session.close()
+    print(json.dumps(result, ensure_ascii=False, indent=1))
 
 
 def _run_single(args, category):
@@ -564,6 +654,20 @@ def main():
     p = sub.add_parser('vector', help='实体向量、有向动作及多步推导（JSON op）')
     p.add_argument('operation', help='结构化 JSON 操作')
     p.set_defaults(func=cmd_vector)
+    p = sub.add_parser('policy-train', help='用分叉标注 JSONL 训练本地控制器')
+    p.add_argument('--data', required=True, help='每行 source、query、edge；edge=null 表示弃权')
+    p.add_argument('--out', required=True, help='新模型文件路径（拒绝覆盖）')
+    p.set_defaults(func=cmd_policy_train)
+    p = sub.add_parser('policy-route', help='让已训练控制器沿有效有向边自主选路')
+    p.add_argument('--model', required=True, help='训练生成的模型 JSON')
+    p.add_argument('--source', required=True, help='起点实体名称')
+    p.add_argument('--query', required=True, help='输入查询')
+    p.add_argument('--max-hops', type=int, default=8, help='最大分叉步数 1–16')
+    p.set_defaults(func=cmd_policy_route)
+    p = sub.add_parser('policy-eval', help='在独立标注集上评估首步选边与弃权')
+    p.add_argument('--model', required=True, help='训练生成的模型 JSON')
+    p.add_argument('--data', required=True, help='独立评估集 JSONL')
+    p.set_defaults(func=cmd_policy_eval)
     args = ap.parse_args()
     args.func(args)
 
