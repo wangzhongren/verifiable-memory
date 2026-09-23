@@ -56,7 +56,12 @@ def replay(entries, capacity):
             ok = False
 
         try:
-            store.validate_op(op)
+            # 旧版将 201–500 字事实拒绝并记录为错误；放宽当前上限后，
+            # 必须按该已记录的旧约束重放，不能把历史拒绝变成成功写入。
+            # 先前已经校验过完整事件链，且仅识别这一条确切的旧错误。
+            legacy_content_error = (entry.get('status') == 'error'
+                                    and entry.get('error') == 'content 必须是 1–200 字的字符串')
+            store.validate_op(op, content_max=200 if legacy_content_error else None)
             allowed = {'teach': {'teach_fact', 'teach_rule'},
                        'correct': {'correct_fact', 'correct_rule'},
                        'ask': {'query_record', 'apply_rule'}}

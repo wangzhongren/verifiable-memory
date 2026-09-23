@@ -100,7 +100,7 @@ class LLM:
             suffix = '/messages' if self.base_url.endswith('/v1') else '/v1/messages'
             url = self.base_url + suffix
             headers['anthropic-version'] = '2023-06-01'
-            payload = {'model': self.model, 'max_tokens': 1024, 'temperature': temperature,
+            payload = {'model': self.model, 'max_tokens': 2048, 'temperature': temperature,
                        'system': system, 'messages': [{'role': 'user', 'content': user}]}
         else:
             url = self.base_url + '/chat/completions'

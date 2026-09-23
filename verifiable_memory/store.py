@@ -19,9 +19,8 @@ import json
 from . import data
 
 STATE_FORMAT = 'verifiable_memory_01/state@v1'
-# 默认 256：容量烤进状态哈希，创建后不可改；16 是从 tiny_llm_memory_01
-# 演示规模继承的旧默认。真成本在证书的全槽哈希表（O(N)/写，更大规模
-# 需先做证书瘦身）与 LLM 解析的槽位上下文（索引/别名，梯子第 3 级）。
+# 默认 256，建库时可指定更大的正整数；容量写入状态哈希，创建后固定。
+# 实际规模受内存、磁盘、O(N) 状态哈希与解析上下文成本限制。
 CAPACITY_DEFAULT = 256
 
 WRITE_OPS = {'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule'}
@@ -29,7 +28,7 @@ READ_OPS = {'query_record', 'apply_rule'}
 ALL_OPS = WRITE_OPS | READ_OPS
 
 NAME_MAX = 24
-CONTENT_MAX = 200
+CONTENT_MAX = 500
 PROGRAM_MAX = 8
 
 
@@ -51,11 +50,12 @@ def state_digest(obj):
     return sha256_string(canonical_json(obj))
 
 
-def validate_op(op):
+def validate_op(op, *, content_max=None):
     """校验 op 的形状与词表白名单（与状态无关的部分）。
 
     合法时原样返回 op；否则抛 StoreError。存在性、容量、种类等
-    状态相关检查由 Store 在执行时做。
+    状态相关检查由 Store 在执行时做。content_max 仅供重放旧验证规则；
+    所有新操作使用当前 CONTENT_MAX，操作内容不能自行指定上限。
     """
     if not isinstance(op, dict):
         raise StoreError('op 必须是对象')
@@ -66,9 +66,10 @@ def validate_op(op):
     if not isinstance(name, str) or not (1 <= len(name) <= NAME_MAX):
         raise StoreError(f'name 必须是 1–{NAME_MAX} 字的字符串')
     if kind in ('teach_fact', 'correct_fact'):
+        limit = CONTENT_MAX if content_max is None else content_max
         content = op.get('content')
-        if not isinstance(content, str) or not (1 <= len(content) <= CONTENT_MAX):
-            raise StoreError(f'content 必须是 1–{CONTENT_MAX} 字的字符串')
+        if not isinstance(content, str) or not (1 <= len(content) <= limit):
+            raise StoreError(f'content 必须是 1–{limit} 字的字符串')
     elif kind in ('teach_rule', 'correct_rule'):
         program = op.get('program')
         if (not isinstance(program, list) or not (1 <= len(program) <= PROGRAM_MAX)
@@ -81,7 +82,7 @@ def validate_op(op):
 
 
 class Store:
-    """16（默认）个命名槽位。状态完全由槽位字典决定。"""
+    """容量可配置的命名槽位，默认 256。状态完全由槽位字典决定。"""
 
     def __init__(self, capacity=CAPACITY_DEFAULT):
         if not isinstance(capacity, int) or capacity < 1:

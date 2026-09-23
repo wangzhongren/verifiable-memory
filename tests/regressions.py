@@ -8,13 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import replay
 import verify
-from verifiable_memory import storage
+from verifiable_memory import storage, store
 from verifiable_memory.audit import AuditError, check_evidence
 from verifiable_memory.session import Session, SessionError
 
@@ -312,6 +313,73 @@ class RegressionTests(unittest.TestCase):
         self.evidence(session)
         _, problems = verify.verify(path, self.root / 'replayed.json')
         self.assertIn('replayed.json 不属于当前证据文件', problems)
+
+    def test_fact_content_500_boundary_and_history(self):
+        session = self.create()
+        for length in (200, 201, 499, 500):
+            with self.subTest(length=length):
+                event = self.apply(session, 'teach_fact', name=f'事实{length}', content='记' * length)
+                self.assertEqual(event['status'], 'ok')
+        # 混合中文、ASCII 和 emoji 按 Python len() 的 Unicode 码点计数。
+        mixed = '记A🙂。' * 125
+        self.assertEqual(len(mixed), 500)
+        corrected = self.apply(session, 'correct_fact', name='事实500', content=mixed)
+        self.assertEqual(corrected['result']['revision'], 2)
+        before = session.terminal_state_hash()
+        for kind, name in [('teach_fact', '超长'), ('correct_fact', '事实500')]:
+            event = self.apply(session, kind, name=name, content='记' * 501)
+            self.assertEqual(event['status'], 'error')
+            self.assertIn('1–500', event['error'])
+            self.assertEqual(event['state_hash_before'], event['state_hash_after'])
+            self.assertEqual(session.terminal_state_hash(), before)
+        restored = self.load(session.path)
+        self.assertEqual(restored.store.slots['事实500']['content'], mixed)
+        path, raw = self.evidence(restored)
+        self.assertEqual(self.verify_payload(path, raw), (0, []))
+
+    def test_legacy_200_limit_errors_still_replay(self):
+        session = self.create()
+        self.apply(session, 'teach_fact', content='旧内容')
+        with patch.object(store, 'CONTENT_MAX', 200):
+            for kind, name in [('teach_fact', '新记录'), ('correct_fact', 'x')]:
+                event = self.apply(session, kind, name=name, content='旧' * 201)
+                self.assertEqual(event['error'], 'content 必须是 1–200 字的字符串')
+        restored = self.load(session.path)
+        self.assertEqual(restored.store.slots['x']['content'], '旧内容')
+        event = self.apply(restored, 'correct_fact', content='新' * 500)
+        self.assertEqual(event['status'], 'ok')
+        path, raw = self.evidence(restored)
+        self.assertEqual(self.verify_payload(path, raw), (0, []))
+
+    def test_500_character_facts_through_real_cli_and_import(self):
+        db = self.root / 'long-facts.db'
+
+        def run(*args, code=0, as_json=True):
+            command = [sys.executable, str(ROOT / 'cli.py'), '--session', str(db), '--no-llm']
+            if as_json:
+                command.append('--json')
+            proc = subprocess.run([*command, *map(str, args)], cwd=self.root,
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout) if as_json else proc
+
+        original = '甲' * 500
+        updated = '乙' * 500
+        self.assertEqual(run('teach', f'教事实 长事实：{original}')['status'], 'ok')
+        self.assertEqual(run('ask', '查询 长事实')['result']['answer'], original)
+        self.assertEqual(run('correct', f'更正事实 长事实：{updated}')['status'], 'ok')
+        run('correct', f'更正事实 长事实：{updated}多', code=1, as_json=False)
+        self.assertEqual(run('ask', '查询 长事实')['result']['answer'], updated)
+        knowledge = self.root / 'long.jsonl'
+        knowledge.write_text('\n'.join(json.dumps({'kind': 'fact', 'name': name, 'content': content})
+                            for name, content in [('导入500', original), ('导入501', original + '多')]))
+        result = run('import', knowledge, code=1, as_json=False)
+        self.assertIn('新增 1', result.stdout)
+        self.assertIn('失败 1', result.stdout)
+        self.assertEqual(run('ask', '查询 导入500')['result']['answer'], original)
+        restored = self.load(db)
+        path, raw = self.evidence(restored)
+        self.assertEqual(self.verify_payload(path, raw), (0, []))
 
 
 if __name__ == '__main__':
