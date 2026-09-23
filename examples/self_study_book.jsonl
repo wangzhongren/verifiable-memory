@@ -1,0 +1,3 @@
+{"source":"A","query":"我要右行","edge":"AB","stop_after":true}
+{"source":"B","query":"从B向右走","edge":null}
+{"source":"A","query":"向上","edge":"AD"}

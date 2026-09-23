@@ -49,7 +49,8 @@ FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 've
                   'verifiable_memory/__init__.py', 'cli.py',
                   'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py',
                   'tests/llm_checks.py', 'tests/vector_checks.py',
-                  'tests/policy_checks.py', 'tests/continual_checks.py']
+                  'tests/policy_checks.py', 'tests/continual_checks.py',
+                  'tests/self_study_checks.py']
 
 
 def _make_llm(args, allow_local=False):
@@ -215,59 +216,28 @@ def cmd_policy_learn(args):
     except session_module.SessionError as exc:
         raise SystemExit(f'持续学习需要已有实体图：{exc}') from exc
     try:
-        slots = session.store.slots
-        policy_module.validate_model(previous, slots)
-        if (previous.get('training_sha256') != policy_module.training_digest(old_rows)
-                or previous.get('n_examples') != len(old_rows)):
-            raise policy_module.PolicyError('旧标注数据与模型记录的训练摘要不符')
-        merged, replaced = policy_module.merge_feedback(old_rows, feedback)
         parent_hash = hashlib.sha256(model_bytes).hexdigest()
-        candidate = policy_module.train(merged, slots, initial_model=previous,
-                                        parent_model_sha256=parent_hash)
-        feedback_labels, _ = policy_module.merge_feedback([], feedback)
-        changed_keys = {(row['source'], row['query']) for row in feedback_labels}
-        retained = [row for row in old_rows
-                    if (row['source'], row['query']) not in changed_keys]
-        old_retained = (policy_module.evaluate(previous, retained, slots)['correct']
-                        if retained else 0)
-        new_retained = (policy_module.evaluate(candidate, retained, slots)['correct']
-                        if retained else 0)
-        old_feedback = policy_module.evaluate(previous, feedback_labels, slots)['correct']
-        new_feedback = policy_module.evaluate(candidate, feedback_labels, slots)['correct']
-        if new_retained < old_retained:
-            raise policy_module.PolicyError(
-                f'旧标注退步：{old_retained}→{new_retained} / {len(retained)}，拒绝更新')
-        if (new_feedback < old_feedback
-                or (old_feedback < len(feedback_labels) and new_feedback == old_feedback)):
-            raise policy_module.PolicyError(
-                f'反馈未改善或出现退步：{old_feedback}→{new_feedback} / '
-                f'{len(feedback_labels)}，拒绝更新')
-        eval_summary = None
-        if holdout is not None:
-            prior_eval = policy_module.evaluate(previous, holdout, slots)
-            new_eval = policy_module.evaluate(candidate, holdout, slots)
-            before, after = prior_eval['correct'], new_eval['correct']
-            regressed = sum(first['correct'] and not second['correct']
-                            for first, second in zip(prior_eval['rows'], new_eval['rows']))
-            if regressed:
-                raise policy_module.PolicyError(
-                    f'独立评估退步：{regressed} 条原本正确的样本变错，'
-                    f'总体 {before}→{after} / {len(holdout)}，拒绝更新')
-            eval_summary = {'before': before, 'after': after, 'n_examples': len(holdout)}
-            candidate['promotion'] = 'evaluated'
-            candidate['evaluation_sha256'] = policy_module.training_digest(holdout)
+        candidate, merged, stats = policy_module.learn(
+            previous, old_rows, feedback, session.store.slots, parent_hash, holdout)
     except policy_module.PolicyError as exc:
         raise SystemExit(f'持续学习被拒绝：{exc}') from exc
     finally:
         session.close()
 
-    model_text = store.canonical_json(candidate) + '\n'
-    data_text = ''.join(store.canonical_json(row) + '\n' for row in merged)
-    for path in (model_out, data_out):
+    _write_policy_pair(model_out, data_out, candidate, merged)
+    report = {**stats, 'model_path': str(model_out), 'data_path': str(data_out)}
+    print(json.dumps(report, ensure_ascii=False, indent=1))
+
+
+def _write_policy_pair(model_out, data_out, model, rows):
+    """只写新版本；第二个文件失败时清理本次已创建的文件。"""
+    content = ((data_out, ''.join(store.canonical_json(row) + '\n' for row in rows)),
+               (model_out, store.canonical_json(model) + '\n'))
+    for path, _ in content:
         path.parent.mkdir(parents=True, exist_ok=True)
     created = []
     try:
-        for path, text in ((data_out, data_text), (model_out, model_text)):
+        for path, text in content:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             created.append(path)
             with os.fdopen(fd, 'w', encoding='utf-8') as target:
@@ -275,18 +245,131 @@ def cmd_policy_learn(args):
     except OSError as exc:
         for path in created:
             path.unlink(missing_ok=True)
-        raise SystemExit(f'持续学习文件写入失败：{exc}') from exc
-    report = {'generation': candidate['generation'],
-              'parent_model_sha256': parent_hash,
-              'n_examples': len(merged), 'feedback_rows': len(feedback_labels),
-              'replaced_labels': replaced,
-              'retained': {'before': old_retained, 'after': new_retained,
-                           'n_examples': len(retained)},
-              'feedback': {'before': old_feedback, 'after': new_feedback,
-                           'n_examples': len(feedback_labels)},
-              'independent_eval': eval_summary,
-              'model_path': str(model_out), 'data_path': str(data_out)}
+        raise SystemExit(f'策略版本文件写入失败：{exc}') from exc
+
+
+def cmd_policy_self_study(args):
+    """模型作答→对照教材→写入精确纠错→尝试生成候选模型。"""
+    model_out, data_out = Path(args.out), Path(args.data_out)
+    sources = {Path(args.model).resolve(), Path(args.data).resolve(),
+               Path(args.book).resolve()}
+    if args.eval:
+        sources.add(Path(args.eval).resolve())
+    if (model_out.resolve() in sources or data_out.resolve() in sources
+            or model_out.resolve() == data_out.resolve()
+            or model_out.exists() or data_out.exists()):
+        raise SystemExit('新模型与新数据必须使用不同的新路径，不能覆盖输入')
+    try:
+        model_bytes = Path(args.model).read_bytes()
+        model = json.loads(model_bytes)
+
+        def jsonl(path):
+            return [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines()
+                    if line.strip()]
+
+        old_rows = jsonl(args.data)
+        book_bytes = Path(args.book).read_bytes()
+        book_rows = [json.loads(line) for line in book_bytes.decode('utf-8').splitlines()
+                     if line.strip()]
+        holdout = jsonl(args.eval) if args.eval else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'自测输入读取失败：{exc}') from exc
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'自测需要已有实体图：{exc}') from exc
+    try:
+        slots = session.store.slots
+        policy_module.validate_model(model, slots)
+        if (model.get('generation', 1) > 1
+                and model.get('promotion') != 'evaluated'
+                and not args.allow_candidate):
+            raise policy_module.PolicyError('候选模型未通过独立评估，实验性自测需 --allow-candidate')
+        if (model.get('training_sha256') != policy_module.training_digest(old_rows)
+                or model.get('n_examples') != len(old_rows)):
+            raise policy_module.PolicyError('原标注文件与模型训练摘要不符')
+        book = policy_module.check_book(book_rows, slots)
+        inspected, model_misses, deployed_misses = [], [], []
+        for item in book:
+            source, query, gold = item['source'], item['query'], item['edge']
+            raw = policy_module.route(model, query, source, slots,
+                                      max_hops=1, use_overrides=False)
+            deployed = policy_module.route(model, query, source, slots,
+                                           max_hops=1, use_overrides=True)
+            raw_choice = raw['decisions'][0]['choice'] if raw['decisions'] else None
+            active_choice = (deployed['decisions'][0]['choice']
+                             if deployed['decisions'] else None)
+            inspected.append({'source': source, 'query': query, 'expected': gold,
+                              'model_choice': raw_choice, 'active_choice': active_choice})
+            if raw_choice != gold:
+                model_misses.append(item)
+            if active_choice != gold:
+                deployed_misses.append(item)
+        corrections = {store.override_name(item['source'], item['query']): item
+                       for item in model_misses + deployed_misses}
+        for name, item in corrections.items():
+            prior = slots.get(name)
+            if prior is not None and prior['kind'] != 'policy_override':
+                raise policy_module.PolicyError('教材纠错名称与已有记录冲突')
+            if (prior is not None and prior['enabled'] and prior['origin'] == 'manual'
+                    and (prior['edge'] != item['edge']
+                         or prior['stop_after'] != item['stop_after'])):
+                raise policy_module.PolicyError('教材答案与人工确认纠错冲突，拒绝自动覆盖')
+        parent_hash = hashlib.sha256(model_bytes).hexdigest()
+        candidate = merged = stats = None
+        regression = None
+        if model_misses:
+            feedback = [{'source': item['source'], 'query': item['query'],
+                         'edge': item['edge']} for item in model_misses]
+            try:
+                candidate, merged, stats = policy_module.learn(
+                    model, old_rows, feedback, slots, parent_hash, holdout)
+            except policy_module.PolicyRegressionError as exc:
+                regression = str(exc)
+        book_hash = hashlib.sha256(book_bytes).hexdigest()
+        written = []
+        for name, item in corrections.items():
+            prior = session.store.slots.get(name)
+            if (prior is not None and policy_module.override_active(prior, session.store.slots)
+                    and prior['edge'] == item['edge']
+                    and prior['stop_after'] == item['stop_after']):
+                continue
+            original = next(row for row in inspected
+                            if row['source'] == item['source'] and row['query'] == item['query'])
+            before = original['model_choice']
+            op = {'op': 'correct_override' if prior is not None else 'teach_override',
+                  'name': name, 'source': item['source'], 'query': item['query'],
+                  'edge': item['edge'], 'enabled': True,
+                  'stop_after': item['stop_after'], 'origin': 'book',
+                  'reason': f'教材核对：模型原选 {before}；正确答案 {item["edge"]}',
+                  'judge': 'book:' + book_hash}
+            entry = session.apply(op, category='policy', source='ai-self-check-book',
+                                  utterance=item['query'])
+            if entry['status'] != 'ok':
+                raise policy_module.PolicyError(entry['error'])
+            verified = policy_module.route(model, item['query'], item['source'],
+                                           session.store.slots, max_hops=1)
+            verified_choice = (verified['decisions'][0]['choice']
+                               if verified['decisions'] else None)
+            if verified_choice != item['edge']:
+                raise policy_module.PolicyError('纠错已写入但复查结果不符')
+            written.append(entry['op_id'])
+    except policy_module.PolicyError as exc:
+        raise SystemExit(f'自测失败：{exc}') from exc
+    finally:
+        session.close()
+    if candidate is not None:
+        _write_policy_pair(model_out, data_out, candidate, merged)
+    report = {'checked': len(book), 'model_misses': len(model_misses),
+              'active_misses': len(deployed_misses),
+              'exact_corrections_written': len(written),
+              'correction_op_ids': written, 'book_sha256': book_hash,
+              'model_update': stats, 'model_update_rejected': regression,
+              'new_model': str(model_out) if candidate is not None else None,
+              'new_data': str(data_out) if candidate is not None else None,
+              'answers': inspected}
     print(json.dumps(report, ensure_ascii=False, indent=1))
+    sys.exit(2 if regression else 0)
 
 
 def cmd_policy_route(args):
@@ -323,6 +406,61 @@ def cmd_policy_route(args):
         session.close()
     _print_entry(entry, args.json)
     sys.exit(1 if entry['status'] == 'error' else 2 if decision['abstained'] else 0)
+
+
+def cmd_policy_correct(args):
+    """把明确反馈存入审计日志，作为同源实体/原话的精确优先路由。"""
+    if args.disable:
+        if args.edge is not None or args.abstain or args.continue_route:
+            raise SystemExit('--disable 不与边选择、弃权或继续路由同时使用')
+        edge, enabled = None, False
+    else:
+        if (args.edge is None) == (not args.abstain):
+            raise SystemExit('必须且只能选择 --edge <边名> 或 --abstain')
+        if args.abstain and args.continue_route:
+            raise SystemExit('弃权不能再继续路由')
+        edge, enabled = args.edge, True
+    name = store.override_name(args.source, args.query)
+    session = session_module.Session.load(args.session)
+    try:
+        if args.disable and name not in session.store.slots:
+            raise SystemExit('无法停用不存在的纠错')
+        op = {'op': 'correct_override' if name in session.store.slots else 'teach_override',
+              'name': name, 'source': args.source, 'query': args.query,
+              'edge': edge, 'enabled': enabled, 'stop_after': not args.continue_route}
+        entry = session.apply(op, category='policy', source='explicit-feedback-cli',
+                              utterance=f'{args.source}: {args.query} -> {edge}')
+    finally:
+        session.close()
+    _print_entry(entry, args.json)
+    sys.exit(0 if entry['status'] == 'ok' else 1)
+
+
+
+def cmd_policy_export_feedback(args):
+    """导出当前图上仍有效的教材核对纠错，供持续学习读取。"""
+    out = Path(args.out)
+    if out.exists():
+        raise SystemExit(f'拒绝覆盖：{out}')
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'导出 AI 反馈失败：{exc}') from exc
+    try:
+        rows = [{'source': rec['source'], 'query': rec['query'], 'edge': rec['edge']}
+                for name, rec in sorted(session.store.slots.items())
+                if rec['kind'] == 'policy_override' and rec['origin'] == 'book'
+                and policy_module.override_active(rec, session.store.slots)]
+    finally:
+        session.close()
+    if not rows:
+        raise SystemExit('没有可导出的当前有效教材纠错')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as target:
+        for row in rows:
+            target.write(store.canonical_json(row) + '\n')
+    print(f'已导出 {len(rows)} 条当前有效教材反馈：{out}')
 
 
 def cmd_policy_eval(args):
@@ -403,10 +541,15 @@ def cmd_status(args):
             elif slot['kind'] == 'vector_action':
                 print(f"  [向量动作] {slot['name']} · 第{rec['revision']}版 · "
                       f"{rec['written_by']} · {len(rec['delta_units'])}维增量")
-            else:
+            elif slot['kind'] == 'edge':
                 active = '有效' if vectors.active_edge(slot['name'], rec, session.store.slots) else '已失效'
                 print(f"  [有向边] {slot['name']} · 第{rec['revision']}版 · "
                       f"{rec['source']} --{rec['action']}--> {rec['target']} · {active}")
+            else:
+                active = '有效' if policy_module.override_active(rec, session.store.slots) else '未启用/已过期'
+                print(f"  [精确纠错] {slot['name']} · 第{rec['revision']}版 · "
+                      f"{rec['source']} / {rec['query']} → {rec['edge']} · {active}"
+                      f" · 来源 {rec['origin']}")
     finally:
         session.close()
 
@@ -424,7 +567,8 @@ def cmd_search(args):
             text = name + ' ' + (
                 rec['content'] if rec['kind'] == 'fact' else
                 '→'.join(rec['program']) if rec['kind'] == 'rule' else
-                f"{rec['source']} {rec['action']} {rec['target']}" if rec['kind'] == 'edge' else '')
+                f"{rec['source']} {rec['action']} {rec['target']}" if rec['kind'] == 'edge' else
+                f"{rec['source']} {rec['query']} {rec['edge']}" if rec['kind'] == 'policy_override' else '')
             if q in text.lower():
                 hits.append((name, rec))
         if not hits:
@@ -783,6 +927,27 @@ def main():
     p.add_argument('--allow-candidate', action='store_true',
                    help='实验性使用尚未通过独立评估的反馈模型')
     p.set_defaults(func=cmd_policy_route)
+    p = sub.add_parser('policy-correct', help='将人工确认的同实体/原话分叉写入记忆库')
+    p.add_argument('--source', required=True, help='源实体名称')
+    p.add_argument('--query', required=True, help='需要精确匹配的原话')
+    override = p.add_mutually_exclusive_group()
+    override.add_argument('--edge', help='确认的有向边名称')
+    override.add_argument('--abstain', action='store_true', help='这条原话应当弃权')
+    override.add_argument('--disable', action='store_true', help='停用现有纠错，回退到模型')
+    p.add_argument('--continue-route', action='store_true', help='纠错一步后继续让模型处理后续路径')
+    p.set_defaults(func=cmd_policy_correct)
+    p = sub.add_parser('policy-export-feedback', help='导出可用于再训练的有效教材纠错')
+    p.add_argument('--out', required=True, help='新 JSONL 文件路径（拒绝覆盖）')
+    p.set_defaults(func=cmd_policy_export_feedback)
+    p = sub.add_parser('policy-self-study', help='模型自测、核对教材、记录错题并继续训练')
+    p.add_argument('--model', required=True, help='当前策略模型')
+    p.add_argument('--data', required=True, help='与当前模型对应的旧训练标注')
+    p.add_argument('--book', required=True, help='有标准答案的独立教材 JSONL')
+    p.add_argument('--out', required=True, help='新模型路径；拒绝覆盖')
+    p.add_argument('--data-out', required=True, help='累积标注路径；拒绝覆盖')
+    p.add_argument('--eval', help='可选的独立保护集；退步时不生成新模型')
+    p.add_argument('--allow-candidate', action='store_true', help='实验性自测候选模型')
+    p.set_defaults(func=cmd_policy_self_study)
     p = sub.add_parser('policy-eval', help='在独立标注集上评估首步选边与弃权')
     p.add_argument('--model', required=True, help='训练生成的模型 JSON')
     p.add_argument('--data', required=True, help='独立评估集 JSONL')

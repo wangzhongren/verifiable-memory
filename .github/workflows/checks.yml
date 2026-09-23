@@ -32,6 +32,8 @@ jobs:
         run: python tests/policy_checks.py
       - name: Continual feedback and retention checks
         run: python tests/continual_checks.py
+      - name: Self-study against sourced answers
+        run: python tests/self_study_checks.py
       - name: Frozen demo
         run: python cli.py script
       - name: Replay demo

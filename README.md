@@ -153,6 +153,8 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 
 对“根据输入自行决定分叉”的需求，新增可训练的本地控制器：用标注的 `(源实体, 查询, 选中边或弃权)` 训练，在当前有效出边中逐步选择路径；不确定时弃权，图变动后要求重新训练。`policy-learn` 可以根据明确反馈从旧权重继续训练，保留累积标注和模型版本；没有独立评估的新版本只标为候选，默认不能路由。选中的路径再交给独立核验器检查方向与向量运算。它是有限动作空间的监督学习原型，不是通用 LLM，也不会自动学出“鸡与篮球指向蔡徐坤”这类语义关系。数据格式、CLI 示例和证明边界见 [docs/POLICY_TRAINING.md](docs/POLICY_TRAINING.md)。
 
+`policy-self-study` 使控制器对照有答案的教材自测：错题先写成记忆库里的精确纠错，同一实体与原话下次优先采用教材答案；模型再用这些错题尝试增量训练。教材必须提供独立答案，模型本身不能给自己的答案打真值标签。策略更新若引起保护集退步会被拒绝，精确纠错仍保留并可重放。见 [自测与核对流程](docs/POLICY_TRAINING.md#像背书一样自测与核对)。
+
 ## 规模化
 
 默认 256 个命名槽位，建库时可用 `--capacity` 指定更大的正整数，代码没有另设固定总量上限。例如 `python3 cli.py --session large-memory.db --capacity 32000 status` 创建一个 32k 容量的新库。容量写入状态哈希，现有库不会自动扩容；需要更大容量时，应保留原库和历史证据，再将知识导入新库。实际规模受内存、磁盘和性能限制，不等于无限存储。
@@ -182,6 +184,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 ├── tests/vector_checks.py            # 向量实体、方向、修订失效与独立推导测试
 ├── tests/policy_checks.py            # 训练、自动选路、弃权和策略版本失效测试
 ├── tests/continual_checks.py         # 反馈增量训练、回归门槛与模型版本链测试
+├── tests/self_study_checks.py        # 教材核对、精确纠错、错题再训练与核验测试
 ├── tests/llm_checks.py               # 本地 HTTP 服务验证协议、配置和 CLI；无需真实密钥
 ├── docs/PROTOCOL.md                  # 预声明的验收标准与期望值（先冻结后执行）
 ├── docs/REPORT.md                    # 研发记录：验收结果、机制事实、抓到的 bug
@@ -198,6 +201,7 @@ python3 tests/regressions.py
 python3 tests/vector_checks.py
 python3 tests/policy_checks.py
 python3 tests/continual_checks.py
+python3 tests/self_study_checks.py
 python3 tests/llm_checks.py
 ```
 

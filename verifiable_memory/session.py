@@ -33,7 +33,7 @@ CATEGORIES = {
     'vector': {'teach_entity', 'correct_entity', 'teach_vector_action',
                'correct_vector_action', 'link_entities',
                'apply_vector_action', 'derive_entities', 'query_record'},
-    'policy': {'route_entities'},
+    'policy': {'route_entities', 'teach_override', 'correct_override'},
 }
 
 

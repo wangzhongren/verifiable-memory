@@ -52,3 +52,22 @@ python3 cli.py --session graph.db policy-learn \
 更新从旧权重继续训练，同时重放旧标注与新反馈。它核对旧训练数据摘要，产生带 `generation` 与父模型 SHA-256 的新模型，并保留旧文件。旧标签未被更正的训练样本或新反馈若退步，更新被拒绝。提供 `--eval` 时，任何原本答对的独立评估样本变错都会拒绝更新；通过后新模型标记为 `evaluated`。这只证明**给定评估集没有退步**，不代表其它问法也不会退步。
 
 不提供 `--eval` 时，新文件标记为 `candidate`，可用 `policy-eval` 检查，但 `policy-route` 默认拒绝部署；只有显式 `--allow-candidate` 才能实验性运行。原始模型与累积标注均不覆盖。后续反馈可以从候选模型继续形成第三版，但每次正式使用仍需检验。实体或边发生变化会使模型图指纹失效，必须在新图上重新建立标注并训练。
+
+## 像背书一样自测与核对
+
+`policy-self-study` 让已训练控制器先答题，再逐题对照有标准答案的教材。教材每行使用 `(source, query, edge)`；可增加布尔 `stop_after`，表示走完被选中的一步就停止。`edge: null` 是应当弃权的标准答案。样例见 [self_study_book.jsonl](../examples/self_study_book.jsonl)。教材的答案应来自已有的有向关系或其他独立可靠来源；**不能把模型自己的输出当作标准答案**。
+
+```bash
+python3 cli.py --session graph.db policy-self-study \
+  --model branch.policy.json \
+  --data examples/branch_policy_training.jsonl \
+  --book examples/self_study_book.jsonl \
+  --out branch-v2.policy.json --data-out branch-v2.policy-data.jsonl \
+  --eval independent.policy-data.jsonl
+```
+
+流程是：模型先用原权重对每道题选第一条边；系统和教材答案比较。错误题的答案写成记忆库中带版本、教材文件 SHA-256 和来源标记的**精确纠错**。之后，同一源实体与原话优先走该纠错；其它问法仍用旧模型。若教材要求“一步”，纠错可以停止后续选路。命中时路径仍须通过原来的方向、修订与向量运算核验。
+
+同时系统从旧权重和累积标注尝试训练下一代模型，保留旧训练集及独立评估门槛。若新模型因其它样本退步而被拒绝，已经核对的错题仍保留为精确纠错；命令退出码为 **2**，不产出新的模型文件。用 `policy-export-feedback --out corrections.policy-feedback.jsonl` 可以从当前有效的教材纠错导出标签，供后续 `policy-learn` 使用。完整原始教材和模型文件应与证据一并保存，单独的 SHA-256 不能证明教材内容本身正确。
+
+这个闭环可以对**已核对的同一原话**提供稳定的纠错优先级。它不能保证近义改写或新图上的表现，也无法自己验证没有答案的开放问题。持续提高这些能力仍取决于教材覆盖范围和独立评估。

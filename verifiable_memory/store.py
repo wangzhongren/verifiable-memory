@@ -16,6 +16,7 @@ sha256_string（哈希函数必须一致结果才可比，这是刻意保留的�
 import hashlib
 import json
 import re
+import unicodedata
 
 from . import data
 from . import vectors
@@ -27,7 +28,8 @@ CAPACITY_DEFAULT = 256
 
 WRITE_OPS = {'teach_fact', 'teach_rule', 'correct_fact', 'correct_rule',
              'teach_entity', 'correct_entity',
-             'teach_vector_action', 'correct_vector_action', 'link_entities'}
+             'teach_vector_action', 'correct_vector_action', 'link_entities',
+             'teach_override', 'correct_override'}
 READ_OPS = {'query_record', 'apply_rule', 'apply_vector_action',
             'derive_entities', 'route_entities'}
 ALL_OPS = WRITE_OPS | READ_OPS
@@ -53,6 +55,16 @@ def sha256_string(s):
 
 def state_digest(obj):
     return sha256_string(canonical_json(obj))
+
+
+def normalize_override_query(query):
+    """只消除首尾空白和 Unicode 等价写法；不猜测近义句。"""
+    return unicodedata.normalize('NFC', query.strip())
+
+
+def override_name(source, query):
+    normalized = normalize_override_query(query)
+    return 'ovr-' + sha256_string(source + '\0' + normalized)[:20]
 
 
 def validate_op(op, *, content_max=None):
@@ -98,6 +110,30 @@ def validate_op(op, *, content_max=None):
             value = op.get(field)
             if not isinstance(value, str) or not 1 <= len(value) <= NAME_MAX:
                 raise StoreError(f'{field} 必须是 1–{NAME_MAX} 字的名称')
+    elif kind in ('teach_override', 'correct_override'):
+        source, query = op.get('source'), op.get('query')
+        if not isinstance(source, str) or not 1 <= len(source) <= NAME_MAX:
+            raise StoreError(f'source 必须是 1–{NAME_MAX} 字的实体名称')
+        if not isinstance(query, str) or not 1 <= len(normalize_override_query(query)) <= 500:
+            raise StoreError('query 必须是 1–500 字的原话')
+        if name != override_name(source, query):
+            raise StoreError('override 名称必须由 source 与原话确定')
+        edge = op.get('edge')
+        if edge is not None and (not isinstance(edge, str) or not 1 <= len(edge) <= NAME_MAX):
+            raise StoreError(f'edge 必须是 1–{NAME_MAX} 字的边名或 null')
+        if type(op.get('enabled', True)) is not bool or type(op.get('stop_after', True)) is not bool:
+            raise StoreError('enabled / stop_after 必须是布尔值')
+        origin = op.get('origin', 'manual')
+        if origin not in ('manual', 'book'):
+            raise StoreError('origin 必须是 manual 或 book')
+        reason = op.get('reason', '')
+        if not isinstance(reason, str) or len(reason) > 500:
+            raise StoreError('reason 最多 500 字')
+        judge = op.get('judge', '')
+        if not isinstance(judge, str) or len(judge) > 160:
+            raise StoreError('judge 最多 160 字')
+        if origin == 'book' and not judge:
+            raise StoreError('教材核对纠错必须记录 judge')
     elif kind in ('apply_vector_action', 'derive_entities', 'route_entities'):
         if not isinstance(op.get('source'), str) or not 1 <= len(op['source']) <= NAME_MAX:
             raise StoreError(f'source 必须是 1–{NAME_MAX} 字的实体名称')
@@ -117,7 +153,8 @@ def validate_op(op, *, content_max=None):
                     or not re.fullmatch(r'[0-9a-f]{64}', op['policy_sha256'])):
                 raise StoreError('policy_sha256 必须是模型文件的 SHA-256')
             if type(op.get('abstained')) is not bool or op.get('reason') not in (
-                    'leaf', 'no_edges', 'uncertain', 'cycle_limit', 'max_hops'):
+                    'leaf', 'no_edges', 'uncertain', 'cycle_limit', 'max_hops',
+                    'confirmed_abstain', 'override_stop', 'stale_override'):
                 raise StoreError('缺少有效的 abstained / reason')
             decisions = op.get('decisions')
             if not isinstance(decisions, list) or len(decisions) not in (len(path), len(path) + 1):
@@ -191,7 +228,8 @@ class Store:
                 raise StoreError(f'名称不存在：{name}（已知槽位: {known}）')
             want_kind = {'correct_fact': 'fact', 'correct_rule': 'rule',
                          'correct_entity': 'entity',
-                         'correct_vector_action': 'vector_action'}[kind]
+                         'correct_vector_action': 'vector_action',
+                         'correct_override': 'policy_override'}[kind]
             if existing['kind'] != want_kind:
                 raise StoreError(f'种类不符：{name} 是 {existing["kind"]}，不能用 {kind} 纠错')
             revision = existing['revision'] + 1
@@ -201,7 +239,8 @@ class Store:
         record = {'kind': ('fact' if kind.endswith('_fact') else
                            'rule' if kind.endswith('_rule') else
                            'entity' if kind.endswith('_entity') else
-                           'vector_action' if kind.endswith('_vector_action') else 'edge'),
+                           'vector_action' if kind.endswith('_vector_action') else
+                           'policy_override' if kind.endswith('_override') else 'edge'),
                   'written_by': op_id, 'revision': revision, 'utterance': utterance}
         if record['kind'] == 'fact':
             record['content'] = op['content']
@@ -213,6 +252,31 @@ class Store:
         elif record['kind'] == 'vector_action':
             record['delta_units'] = vectors.quantize(op['delta'], 'delta')
             record['vector_scale'] = vectors.SCALE
+        elif record['kind'] == 'policy_override':
+            from . import policy
+            source = self.slots.get(op['source'])
+            if source is None or source['kind'] != 'entity':
+                raise StoreError(f'纠错必须引用已有源实体：{op["source"]}')
+            if existing is not None and (existing['source'] != op['source']
+                                         or existing['query'] != normalize_override_query(op['query'])):
+                raise StoreError('override 名称冲突或原话不匹配')
+            edge_name = op.get('edge')
+            if op.get('enabled', True) and edge_name is not None:
+                edge = self.slots.get(edge_name)
+                if (edge is None or edge['kind'] != 'edge'
+                        or edge['source'] != op['source']
+                        or not vectors.active_edge(edge_name, edge, self.slots)):
+                    raise StoreError(f'人工纠错边不是源实体的有效出边：{edge_name}')
+            record.update({'source': op['source'],
+                           'source_revision': source['revision'],
+                           'query': normalize_override_query(op['query']),
+                           'edge': edge_name,
+                           'enabled': op.get('enabled', True),
+                           'stop_after': op.get('stop_after', True),
+                           'origin': op.get('origin', 'manual'),
+                           'reason': op.get('reason', ''),
+                           'judge': op.get('judge', ''),
+                           'graph_signature': policy.graph_signature(self.slots)})
         else:
             refs = {}
             for key, want in (('source', 'entity'), ('action', 'vector_action'),
@@ -265,6 +329,16 @@ class Store:
             elif record['kind'] == 'vector_action':
                 result['delta'] = vectors.display(record['delta_units'])
                 result['answer'] = result['delta']
+            elif record['kind'] == 'policy_override':
+                from . import policy
+                result.update({'source': record['source'], 'query': record['query'],
+                               'edge': record['edge'],
+                               'enabled': record['enabled'],
+                               'origin': record['origin'],
+                               'reason': record['reason'],
+                               'judge': record['judge'],
+                               'active': policy.override_active(record, self.slots),
+                               'answer': record['edge'] if record['enabled'] else None})
             else:
                 result['source'], result['action'], result['target'] = (
                     record['source'], record['action'], record['target'])
@@ -339,6 +413,50 @@ class Store:
                               'after': vectors.display(right['vector_units'])})
             if current != name:
                 raise StoreError(f'路径终点 {current} 与目标实体 {name} 不符')
+            if kind == 'route_entities':
+                from . import policy
+                decision_source = op['source']
+                visited = {decision_source}
+                for index, decision in enumerate(op['decisions']):
+                    if decision['source'] != decision_source:
+                        raise StoreError('策略决策的源实体与路径不一致')
+                    override = self.slots.get(override_name(decision_source, op['query']))
+                    effective = (override is not None
+                                 and override['kind'] == 'policy_override'
+                                 and policy.override_active(override, self.slots))
+                    if effective:
+                        if (decision.get('override') != override_name(decision_source, op['query'])
+                                or decision.get('override_revision') != override['revision']
+                                or decision.get('override_written_by') != override['written_by']
+                                or decision.get('override_hash') != state_digest(override)):
+                            raise StoreError('策略未优先使用有效的人工纠错')
+                        expected_edge = override['edge']
+                        cycle_blocked = (expected_edge is not None
+                                         and self.slots[expected_edge]['target'] in visited)
+                        if decision['choice'] != expected_edge and not (
+                                cycle_blocked and decision['choice'] is None
+                                and op['reason'] == 'cycle_limit'):
+                            raise StoreError('策略选择与人工纠错不一致')
+                        if expected_edge is None and op['reason'] != 'confirmed_abstain':
+                            raise StoreError('教材要求弃权，策略结果却未标为确认弃权')
+                        if override['stop_after'] and decision['choice'] is not None:
+                            if index != len(op['decisions']) - 1 or op['reason'] != 'override_stop':
+                                raise StoreError('人工纠错要求单步停止')
+                    elif decision.get('override') is not None:
+                        raise StoreError('策略引用了过期的人工纠错')
+                    if decision['choice'] is not None:
+                        decision_source = self.slots[decision['choice']]['target']
+                        visited.add(decision_source)
+                if op['reason'] == 'confirmed_abstain' and not (
+                        op['decisions'] and op['decisions'][-1].get('override')
+                        and op['decisions'][-1]['choice'] is None):
+                    raise StoreError('确认弃权缺少人工纠错证据')
+                if op['reason'] == 'stale_override':
+                    stale = self.slots.get(override_name(current, op['query']))
+                    if (stale is None or stale['kind'] != 'policy_override'
+                            or not stale['enabled']
+                            or policy.override_active(stale, self.slots)):
+                        raise StoreError('声明的过期人工纠错不存在')
             result = {'name': name, 'kind': 'entity_derivation',
                       'written_by': record['written_by'], 'revision': record['revision'],
                       'source': op['source'], 'source_revision': source['revision'],

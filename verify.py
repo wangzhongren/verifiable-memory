@@ -25,6 +25,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 import hashlib
 import json
 import sys
+import unicodedata
 from pathlib import Path
 
 # 哈希公共面：与 store.py 刻意共享的唯一函数。
@@ -67,7 +68,8 @@ def _valid_input(s):
 
 
 VECTOR_WRITES = {'teach_entity', 'correct_entity', 'teach_vector_action',
-                 'correct_vector_action', 'link_entities'}
+                 'correct_vector_action', 'link_entities',
+                 'teach_override', 'correct_override'}
 
 
 def _vector_units(values):
@@ -113,12 +115,45 @@ def _independent_path(source, target, slots, max_hops):
     raise VerifyError(f'独立实现未找到有向路径：{source}→{target}')
 
 
+def _independent_override_name(source, query):
+    normalized = unicodedata.normalize('NFC', query.strip())
+    return 'ovr-' + sha256_string(source + '\0' + normalized)[:20]
+
+
+def _independent_graph_signature(slots):
+    anchors = []
+    for name, edge in sorted(slots.items()):
+        if edge['kind'] == 'edge' and _edge_is_current(edge, slots):
+            anchors.append({'edge': name,
+                            'edge_hash': sha256_string(canonical_json(edge)),
+                            'source_hash': sha256_string(canonical_json(slots[edge['source']])),
+                            'action_hash': sha256_string(canonical_json(slots[edge['action']])),
+                            'target_hash': sha256_string(canonical_json(slots[edge['target']]))})
+    return sha256_string(canonical_json({'format': 'vector-graph@v1', 'anchors': anchors}))
+
+
+def _independent_override_active(record, slots):
+    if record['kind'] != 'policy_override' or not record['enabled']:
+        return False
+    source = slots.get(record['source'])
+    if (source is None or source['kind'] != 'entity'
+            or source['revision'] != record['source_revision']
+            or record['graph_signature'] != _independent_graph_signature(slots)):
+        return False
+    if record['edge'] is None:
+        return True
+    edge = slots.get(record['edge'])
+    return (edge is not None and edge['kind'] == 'edge'
+            and edge['source'] == record['source'] and _edge_is_current(edge, slots))
+
+
 def _record_from_write(op, slots):
     """从 op 独立构造槽位记录（字段与 store 约定一致，但独立写出）。"""
     kind = ('fact' if op['op'].endswith('_fact') else
             'rule' if op['op'].endswith('_rule') else
             'entity' if op['op'].endswith('_entity') else
-            'vector_action' if op['op'].endswith('_vector_action') else 'edge')
+            'vector_action' if op['op'].endswith('_vector_action') else
+            'policy_override' if op['op'].endswith('_override') else 'edge')
     record = {'kind': kind, 'written_by': op['_op_id'], 'revision': op['_revision'],
               'utterance': op['_utterance']}
     if kind == 'fact':
@@ -131,6 +166,27 @@ def _record_from_write(op, slots):
     elif kind == 'vector_action':
         record['delta_units'] = _vector_units(op['delta'])
         record['vector_scale'] = 1_000_000
+    elif kind == 'policy_override':
+        source = slots.get(op['source'])
+        if source is None or source['kind'] != 'entity':
+            raise VerifyError('人工纠错引用无效源实体')
+        normalized = unicodedata.normalize('NFC', op['query'].strip())
+        if op['name'] != _independent_override_name(op['source'], normalized):
+            raise VerifyError('人工纠错名称与实体/原话不符')
+        if op.get('enabled', True) and op.get('edge') is not None:
+            edge = slots.get(op['edge'])
+            if (edge is None or edge['kind'] != 'edge'
+                    or edge['source'] != op['source']
+                    or not _edge_is_current(edge, slots)):
+                raise VerifyError('人工纠错引用无效边')
+        record.update({'source': op['source'], 'source_revision': source['revision'],
+                       'query': normalized, 'edge': op.get('edge'),
+                       'enabled': op.get('enabled', True),
+                       'stop_after': op.get('stop_after', True),
+                       'origin': op.get('origin', 'manual'),
+                       'reason': op.get('reason', ''),
+                       'judge': op.get('judge', ''),
+                       'graph_signature': _independent_graph_signature(slots)})
     else:
         for key, want in (('source', 'entity'), ('action', 'vector_action'),
                           ('target', 'entity')):
@@ -349,6 +405,13 @@ def verify(session_path, replayed_path):
                                 'target': rec['target'],
                                 'active': _edge_is_current(rec, slots),
                                 'answer': f"{rec['source']} --{rec['action']}--> {rec['target']}"}
+                elif rec['kind'] == 'policy_override':
+                    expected = {'source': rec['source'], 'query': rec['query'],
+                                'edge': rec['edge'], 'enabled': rec['enabled'],
+                                'origin': rec['origin'], 'reason': rec['reason'],
+                                'judge': rec['judge'],
+                                'active': _independent_override_active(rec, slots),
+                                'answer': rec['edge'] if rec['enabled'] else None}
                 else:
                     continue
             elif op['op'] == 'apply_vector_action':
@@ -404,6 +467,37 @@ def verify(session_path, replayed_path):
                     if any(op['decisions'][i]['choice'] != edge
                            for i, edge in enumerate(path)):
                         raise VerifyError('策略决策与选中边不一致')
+                    here = op['source']
+                    for decision in op['decisions']:
+                        if decision['source'] != here:
+                            raise VerifyError('策略决策源实体与路径不一致')
+                        name = _independent_override_name(here, op['query'])
+                        correction = slots.get(name)
+                        effective = (correction is not None
+                                     and correction['kind'] == 'policy_override'
+                                     and _independent_override_active(correction, slots))
+                        if effective:
+                            if (decision.get('override') != name
+                                    or decision.get('override_revision') != correction['revision']
+                                    or decision.get('override_written_by') != correction['written_by']
+                                    or decision.get('override_hash') != sha256_string(
+                                        canonical_json(correction))):
+                                raise VerifyError('没有优先使用当前人工纠错')
+                            if decision['choice'] != correction['edge'] and not (
+                                    decision['choice'] is None and op['reason'] == 'cycle_limit'):
+                                raise VerifyError('策略选择与人工纠错冲突')
+                            if correction['edge'] is None and op['reason'] != 'confirmed_abstain':
+                                raise VerifyError('教材要求弃权但策略结果不一致')
+                        elif decision.get('override') is not None:
+                            raise VerifyError('策略引用了失效人工纠错')
+                        if decision['choice'] is not None:
+                            here = slots[decision['choice']]['target']
+                    if op['reason'] == 'stale_override':
+                        stale = slots.get(_independent_override_name(here, op['query']))
+                        if (stale is None or stale['kind'] != 'policy_override'
+                                or not stale['enabled']
+                                or _independent_override_active(stale, slots)):
+                            raise VerifyError('声明的过期人工纠错并未失效')
                     expected.update({'query': op['query'],
                                      'policy_sha256': op['policy_sha256'],
                                      'decisions': op['decisions'],
