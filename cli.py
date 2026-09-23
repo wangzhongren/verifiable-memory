@@ -49,7 +49,7 @@ FREEZE_SOURCES = ['verifiable_memory/audit.py', 'verifiable_memory/data.py', 've
                   'verifiable_memory/__init__.py', 'cli.py',
                   'replay.py', 'verify.py', 'tests/checks.py', 'tests/regressions.py',
                   'tests/llm_checks.py', 'tests/vector_checks.py',
-                  'tests/policy_checks.py']
+                  'tests/policy_checks.py', 'tests/continual_checks.py']
 
 
 def _make_llm(args, allow_local=False):
@@ -186,6 +186,109 @@ def cmd_policy_train(args):
           f' · 文件 {out}')
 
 
+def cmd_policy_learn(args):
+    """按反馈增量更新权重，保留旧模型和完整标注历史。"""
+    model_out, data_out = Path(args.out), Path(args.data_out)
+    source_paths = {Path(args.model).resolve(), Path(args.data).resolve(),
+                    Path(args.feedback).resolve()}
+    if args.eval:
+        source_paths.add(Path(args.eval).resolve())
+    if (model_out.resolve() in source_paths or data_out.resolve() in source_paths
+            or model_out.resolve() == data_out.resolve()
+            or model_out.exists() or data_out.exists()):
+        raise SystemExit('输出文件必须为两个新的不同路径，且不能覆盖模型或标注输入')
+    try:
+        model_bytes = Path(args.model).read_bytes()
+        previous = json.loads(model_bytes)
+
+        def read_jsonl(path):
+            return [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines()
+                    if line.strip()]
+
+        old_rows = read_jsonl(args.data)
+        feedback = read_jsonl(args.feedback)
+        holdout = read_jsonl(args.eval) if args.eval else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'持续学习输入读取失败：{exc}') from exc
+    try:
+        session = session_module.Session.load(args.session)
+    except session_module.SessionError as exc:
+        raise SystemExit(f'持续学习需要已有实体图：{exc}') from exc
+    try:
+        slots = session.store.slots
+        policy_module.validate_model(previous, slots)
+        if (previous.get('training_sha256') != policy_module.training_digest(old_rows)
+                or previous.get('n_examples') != len(old_rows)):
+            raise policy_module.PolicyError('旧标注数据与模型记录的训练摘要不符')
+        merged, replaced = policy_module.merge_feedback(old_rows, feedback)
+        parent_hash = hashlib.sha256(model_bytes).hexdigest()
+        candidate = policy_module.train(merged, slots, initial_model=previous,
+                                        parent_model_sha256=parent_hash)
+        feedback_labels, _ = policy_module.merge_feedback([], feedback)
+        changed_keys = {(row['source'], row['query']) for row in feedback_labels}
+        retained = [row for row in old_rows
+                    if (row['source'], row['query']) not in changed_keys]
+        old_retained = (policy_module.evaluate(previous, retained, slots)['correct']
+                        if retained else 0)
+        new_retained = (policy_module.evaluate(candidate, retained, slots)['correct']
+                        if retained else 0)
+        old_feedback = policy_module.evaluate(previous, feedback_labels, slots)['correct']
+        new_feedback = policy_module.evaluate(candidate, feedback_labels, slots)['correct']
+        if new_retained < old_retained:
+            raise policy_module.PolicyError(
+                f'旧标注退步：{old_retained}→{new_retained} / {len(retained)}，拒绝更新')
+        if (new_feedback < old_feedback
+                or (old_feedback < len(feedback_labels) and new_feedback == old_feedback)):
+            raise policy_module.PolicyError(
+                f'反馈未改善或出现退步：{old_feedback}→{new_feedback} / '
+                f'{len(feedback_labels)}，拒绝更新')
+        eval_summary = None
+        if holdout is not None:
+            prior_eval = policy_module.evaluate(previous, holdout, slots)
+            new_eval = policy_module.evaluate(candidate, holdout, slots)
+            before, after = prior_eval['correct'], new_eval['correct']
+            regressed = sum(first['correct'] and not second['correct']
+                            for first, second in zip(prior_eval['rows'], new_eval['rows']))
+            if regressed:
+                raise policy_module.PolicyError(
+                    f'独立评估退步：{regressed} 条原本正确的样本变错，'
+                    f'总体 {before}→{after} / {len(holdout)}，拒绝更新')
+            eval_summary = {'before': before, 'after': after, 'n_examples': len(holdout)}
+            candidate['promotion'] = 'evaluated'
+            candidate['evaluation_sha256'] = policy_module.training_digest(holdout)
+    except policy_module.PolicyError as exc:
+        raise SystemExit(f'持续学习被拒绝：{exc}') from exc
+    finally:
+        session.close()
+
+    model_text = store.canonical_json(candidate) + '\n'
+    data_text = ''.join(store.canonical_json(row) + '\n' for row in merged)
+    for path in (model_out, data_out):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    created = []
+    try:
+        for path, text in ((data_out, data_text), (model_out, model_text)):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created.append(path)
+            with os.fdopen(fd, 'w', encoding='utf-8') as target:
+                target.write(text)
+    except OSError as exc:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise SystemExit(f'持续学习文件写入失败：{exc}') from exc
+    report = {'generation': candidate['generation'],
+              'parent_model_sha256': parent_hash,
+              'n_examples': len(merged), 'feedback_rows': len(feedback_labels),
+              'replaced_labels': replaced,
+              'retained': {'before': old_retained, 'after': new_retained,
+                           'n_examples': len(retained)},
+              'feedback': {'before': old_feedback, 'after': new_feedback,
+                           'n_examples': len(feedback_labels)},
+              'independent_eval': eval_summary,
+              'model_path': str(model_out), 'data_path': str(data_out)}
+    print(json.dumps(report, ensure_ascii=False, indent=1))
+
+
 def cmd_policy_route(args):
     """逐节点自主选择分支，再让 Store 验证选中路径与向量运算。"""
     try:
@@ -198,6 +301,12 @@ def cmd_policy_route(args):
     except session_module.SessionError as exc:
         raise SystemExit(f'策略路由需要已有实体图：{exc}') from exc
     try:
+        if (model.get('generation', 1) > 1
+                and model.get('promotion') != 'evaluated'
+                and not args.allow_candidate):
+            raise policy_module.PolicyError(
+                '增量模型仍是候选版；先用独立评估通过的版本，'
+                '实验性路由需显式 --allow-candidate')
         decision = policy_module.route(model, args.query, args.source,
                                        session.store.slots, args.max_hops)
         op = {'op': 'route_entities', 'name': decision['target'],
@@ -658,11 +767,21 @@ def main():
     p.add_argument('--data', required=True, help='每行 source、query、edge；edge=null 表示弃权')
     p.add_argument('--out', required=True, help='新模型文件路径（拒绝覆盖）')
     p.set_defaults(func=cmd_policy_train)
+    p = sub.add_parser('policy-learn', help='用新标注从旧模型继续训练，输出新版本')
+    p.add_argument('--model', required=True, help='上一版模型文件')
+    p.add_argument('--data', required=True, help='与模型摘要一致的上一版标注 JSONL')
+    p.add_argument('--feedback', required=True, help='本次新增或更正的标注 JSONL')
+    p.add_argument('--out', required=True, help='新模型路径（拒绝覆盖）')
+    p.add_argument('--data-out', required=True, help='合并后的新标注路径（拒绝覆盖）')
+    p.add_argument('--eval', help='可选的独立评估 JSONL；指标退步时拒绝更新')
+    p.set_defaults(func=cmd_policy_learn)
     p = sub.add_parser('policy-route', help='让已训练控制器沿有效有向边自主选路')
     p.add_argument('--model', required=True, help='训练生成的模型 JSON')
     p.add_argument('--source', required=True, help='起点实体名称')
     p.add_argument('--query', required=True, help='输入查询')
     p.add_argument('--max-hops', type=int, default=8, help='最大分叉步数 1–16')
+    p.add_argument('--allow-candidate', action='store_true',
+                   help='实验性使用尚未通过独立评估的反馈模型')
     p.set_defaults(func=cmd_policy_route)
     p = sub.add_parser('policy-eval', help='在独立标注集上评估首步选边与弃权')
     p.add_argument('--model', required=True, help='训练生成的模型 JSON')

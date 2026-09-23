@@ -36,3 +36,19 @@ python3 cli.py --session graph.db policy-eval \
 控制器每次输出所选边、候选分数和模型文件 SHA-256。`route_entities` 再把这条路径送入既有确定性内核：它逐边检查方向、引用修订及 `v(B)=v(A)+Δ(a)`，记录每步槽哈希，允许完整重放和第二套实现核验。**核验器证明给定路径的运算成立；它不证明模型选择这条路径符合问题含义。** 没有附带模型文件时，导出的会话只保留其 SHA-256，不能独立重算模型的全部打分；模型文件与原训练数据应和证据一同保留。
 
 模型训练时绑定当前有效图的指纹（边及其源实体、动作、目标实体的哈希）。新增边或更正关联实体/动作后，旧模型拒绝继续路由，需重新收集标注并训练。第一版学习的是**已知边 ID 的选择**，不能对新边零样本泛化；图外语义联想，如“鸡、篮球 → 蔡徐坤”，仍需具体训练样本和可解释关系，不能从普通向量加法直接得到。
+
+## 接收反馈并持续学习
+
+用户或评估者可以对一次错误选择给出新的 `(source, query, edge)` 标签；`edge: null` 表示此处应该弃权。同一源实体与原话的新标签替换旧标签。反馈**必须来自外部正确答案或明确的用户更正**；数值路径核验通过，不能自动当作“模型分支选对”的训练信号。
+
+```bash
+python3 cli.py --session graph.db policy-learn \
+  --model branch.policy.json --data examples/branch_policy_training.jsonl \
+  --feedback corrections.policy-feedback.jsonl \
+  --out branch-v2.policy.json --data-out branch-v2.policy-data.jsonl \
+  --eval independent.policy-data.jsonl
+```
+
+更新从旧权重继续训练，同时重放旧标注与新反馈。它核对旧训练数据摘要，产生带 `generation` 与父模型 SHA-256 的新模型，并保留旧文件。旧标签未被更正的训练样本或新反馈若退步，更新被拒绝。提供 `--eval` 时，任何原本答对的独立评估样本变错都会拒绝更新；通过后新模型标记为 `evaluated`。这只证明**给定评估集没有退步**，不代表其它问法也不会退步。
+
+不提供 `--eval` 时，新文件标记为 `candidate`，可用 `policy-eval` 检查，但 `policy-route` 默认拒绝部署；只有显式 `--allow-candidate` 才能实验性运行。原始模型与累积标注均不覆盖。后续反馈可以从候选模型继续形成第三版，但每次正式使用仍需检验。实体或边发生变化会使模型图指纹失效，必须在新图上重新建立标注并训练。

@@ -151,7 +151,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 
 现在可以把实体存为向量，把动作存为可复用的向量增量，并记录 `A --动作--> B`。只有量化后 `v(B) = v(A) + Δ(动作)` 才能建边；多步推导返回每一步的实体、动作、向量和修订证据。实体或动作被更正时，引用旧修订的边自动退出当前推导，但历史记录不消失。CLI 使用结构化 JSON `vector` 子命令，Python 使用 `Session.apply(..., category="vector")`。这适用于明确定义了向量和动作的系统，不会自动学出“鸡与篮球指向蔡徐坤”这类语义关系。完整语义、操作示例和边界见 [docs/VECTOR_PROTOCOL.md](docs/VECTOR_PROTOCOL.md)。
 
-对“根据输入自行决定分叉”的需求，新增可训练的本地控制器：用标注的 `(源实体, 查询, 选中边或弃权)` 训练，在当前有效出边中逐步选择路径；不确定时弃权，图变动后要求重新训练。选中的路径再交给独立核验器检查方向与向量运算。它是有限动作空间的监督学习原型，不是通用 LLM，也不会自动学出“鸡与篮球指向蔡徐坤”这类语义关系。数据格式、CLI 示例和证明边界见 [docs/POLICY_TRAINING.md](docs/POLICY_TRAINING.md)。
+对“根据输入自行决定分叉”的需求，新增可训练的本地控制器：用标注的 `(源实体, 查询, 选中边或弃权)` 训练，在当前有效出边中逐步选择路径；不确定时弃权，图变动后要求重新训练。`policy-learn` 可以根据明确反馈从旧权重继续训练，保留累积标注和模型版本；没有独立评估的新版本只标为候选，默认不能路由。选中的路径再交给独立核验器检查方向与向量运算。它是有限动作空间的监督学习原型，不是通用 LLM，也不会自动学出“鸡与篮球指向蔡徐坤”这类语义关系。数据格式、CLI 示例和证明边界见 [docs/POLICY_TRAINING.md](docs/POLICY_TRAINING.md)。
 
 ## 规模化
 
@@ -181,6 +181,7 @@ python3 cli.py paraphrases --out paraphrases.json   # 改写基准 v2，拒绝�
 ├── tests/regressions.py              # 检查点边界、完整事件链和事务回滚回归测试
 ├── tests/vector_checks.py            # 向量实体、方向、修订失效与独立推导测试
 ├── tests/policy_checks.py            # 训练、自动选路、弃权和策略版本失效测试
+├── tests/continual_checks.py         # 反馈增量训练、回归门槛与模型版本链测试
 ├── tests/llm_checks.py               # 本地 HTTP 服务验证协议、配置和 CLI；无需真实密钥
 ├── docs/PROTOCOL.md                  # 预声明的验收标准与期望值（先冻结后执行）
 ├── docs/REPORT.md                    # 研发记录：验收结果、机制事实、抓到的 bug
@@ -196,6 +197,7 @@ python3 tests/checks.py
 python3 tests/regressions.py
 python3 tests/vector_checks.py
 python3 tests/policy_checks.py
+python3 tests/continual_checks.py
 python3 tests/llm_checks.py
 ```
 

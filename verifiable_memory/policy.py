@@ -14,6 +14,7 @@ from .store import canonical_json, state_digest
 FORMAT = 'verifiable_memory/branch_policy@v1'
 STOP = '__stop__'
 EPOCHS = 120
+UPDATE_EPOCHS = 200
 LEARNING_RATE = 0.18
 
 
@@ -76,7 +77,43 @@ def _probabilities(model, query, source, slots, visited=None):
     return scores, {name: exps[name] / denominator for name in candidates}
 
 
-def train(rows, slots):
+def training_digest(rows):
+    return hashlib.sha256(canonical_json(rows).encode('utf-8')).hexdigest()
+
+
+def merge_feedback(rows, feedback):
+    """同一源实体/原话的新标签替换旧标签，避免互相矛盾的监督。"""
+    if not isinstance(feedback, list) or not feedback:
+        raise PolicyError('反馈必须是非空 JSONL')
+    merged, index = [], {}
+    for position, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or set(row) != {'source', 'query', 'edge'}:
+            raise PolicyError(f'旧标注第 {position} 行格式不符')
+        if not isinstance(row['source'], str) or not isinstance(row['query'], str):
+            raise PolicyError(f'旧标注第 {position} 行 source/query 必须是字符串')
+        key = (row['source'], row['query'])
+        if key in index:
+            merged[index[key]] = dict(row)
+        else:
+            index[key] = len(merged)
+            merged.append(dict(row))
+    replaced = 0
+    for position, row in enumerate(feedback, 1):
+        if not isinstance(row, dict) or set(row) != {'source', 'query', 'edge'}:
+            raise PolicyError(f'反馈第 {position} 行需要 source、query、edge 三个字段')
+        if not isinstance(row['source'], str) or not isinstance(row['query'], str):
+            raise PolicyError(f'反馈第 {position} 行 source/query 必须是字符串')
+        key = (row['source'], row['query'])
+        if key in index:
+            merged[index[key]] = dict(row)
+            replaced += 1
+        else:
+            index[key] = len(merged)
+            merged.append(dict(row))
+    return merged, replaced
+
+
+def train(rows, slots, *, initial_model=None, parent_model_sha256=None):
     if not isinstance(rows, list) or not rows:
         raise PolicyError('训练集必须是非空 JSONL')
     if not any(rec['kind'] == 'edge' and vectors.active_edge(name, rec, slots)
@@ -110,11 +147,21 @@ def train(rows, slots):
     missing_abstain = sources - abstain_sources
     if missing_abstain:
         raise PolicyError(f'训练集缺少这些源实体的弃权样本：{sorted(missing_abstain)}')
-    weights = {name: {} for name in [STOP] + all_edges}
-    bias = {name: 0.0 for name in weights}
+    if initial_model is None:
+        weights = {name: {} for name in [STOP] + all_edges}
+        bias = {name: 0.0 for name in weights}
+        epochs, generation = EPOCHS, 1
+    else:
+        validate_model(initial_model, slots)
+        if not isinstance(parent_model_sha256, str) or len(parent_model_sha256) != 64:
+            raise PolicyError('增量更新必须记录上一版模型 SHA-256')
+        weights = {name: dict(initial_model['weights'][name]) for name in [STOP] + all_edges}
+        bias = {name: float(initial_model['bias'][name]) for name in weights}
+        epochs = UPDATE_EPOCHS
+        generation = initial_model.get('generation', 1) + 1
     order = list(range(len(samples)))
-    rng = random.Random(7)
-    for _ in range(EPOCHS):
+    rng = random.Random(7 if initial_model is None else 7 + generation)
+    for _ in range(epochs):
         rng.shuffle(order)
         for index in order:
             options, label, feats = samples[index]
@@ -130,8 +177,11 @@ def train(rows, slots):
                 for feature in feats:
                     weights[name][feature] = weights[name].get(feature, 0.0) + step
     model = {'format': FORMAT, 'graph_signature': graph_signature(slots),
-             'training_sha256': hashlib.sha256(canonical_json(rows).encode('utf-8')).hexdigest(),
-             'n_examples': len(rows), 'epochs': EPOCHS,
+             'training_sha256': training_digest(rows),
+             'n_examples': len(rows), 'epochs': epochs,
+             'generation': generation,
+             'parent_model_sha256': parent_model_sha256,
+             'promotion': 'initial' if initial_model is None else 'candidate',
              'minimum_probability': 0.55, 'minimum_margin': 0.08,
              'weights': {name: {key: round(value, 8) for key, value in row.items()
                                 if abs(value) > 1e-8}
@@ -147,6 +197,11 @@ def validate_model(model, slots):
         raise PolicyError('实体/动作/有向边已变化，模型已过期，请重新训练')
     if not isinstance(model.get('weights'), dict) or not isinstance(model.get('bias'), dict):
         raise PolicyError('模型缺少参数')
+    if 'generation' in model and (type(model['generation']) is not int
+                                  or model['generation'] < 1):
+        raise PolicyError('模型 generation 非法')
+    if model.get('promotion', 'initial') not in ('initial', 'candidate', 'evaluated'):
+        raise PolicyError('模型 promotion 非法')
     expected = {STOP} | {name for name, rec in slots.items()
                          if rec['kind'] == 'edge' and vectors.active_edge(name, rec, slots)}
     if set(model['weights']) != expected or set(model['bias']) != expected:
